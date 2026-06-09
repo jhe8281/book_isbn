@@ -1,2 +1,2 @@
 # book_isbn
-ISBN 존재여부를 api호출해서 확인
+ISBN 존재여부를 국릭중앙도서관 API 호출해서 확인
