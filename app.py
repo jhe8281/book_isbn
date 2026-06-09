@@ -38,11 +38,22 @@ st.set_page_config(page_title="독서기록 ISBN 검증 대시보드", page_icon
 # ---------------------------------------------------------------------------
 # 유틸리티 함수
 # ---------------------------------------------------------------------------
+def strip_html(text) -> str:
+    """응답에 섞인 <span ...>...</span> 같은 HTML 태그와 엔티티를 제거."""
+    if text is None:
+        return ""
+    s = str(text)
+    s = re.sub(r"<[^>]+>", "", s)           # 태그 제거
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    s = s.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+    return s.strip()
+
+
 def normalize(text) -> str:
     """공백/특수문자를 제거하고 소문자화하여 비교용 문자열로 정규화."""
     if text is None:
         return ""
-    s = str(text)
+    s = strip_html(text)                       # HTML 태그 먼저 제거
     s = re.sub(r"[\s\u200b]+", "", s)          # 공백 및 zero-width space 제거
     s = re.sub(r"[^\w가-힣]", "", s)           # 한글/영숫자 외 기호 제거
     return s.lower()
@@ -64,13 +75,13 @@ def get_stored_key() -> str:
 
 
 def clean_author(author_raw: str) -> str:
-    """API의 저자 필드에서 '지은이', '저', ';' 등 부가 표기를 정리."""
+    """API의 저자 필드에서 HTML 태그와 '지은이', '저', ';' 등 부가 표기를 정리."""
     if not author_raw:
         return ""
-    s = str(author_raw)
+    s = strip_html(author_raw)
     # 첫 번째 구분자 이전의 대표 저자만 사용
     s = re.split(r"[;,/]", s)[0]
-    s = re.sub(r"(지은이|옮긴이|저자|저|글|그림|편|역|엮음)\s*[:：]?", "", s)
+    s = re.sub(r"(지은이|옮긴이|저자|저|글|그림|편|역|엮음|원작|감독)\s*[:：]?", "", s)
     return s.strip()
 
 
@@ -177,8 +188,8 @@ def match_book(title: str, author: str, docs: list):
 
     best_doc, best_score = None, 0
     for doc in docs:
-        doc_title = normalize(doc.get("title_info", ""))
-        doc_author = normalize(clean_author(doc.get("author_info", "")))
+        doc_title = normalize(doc.get("titleInfo", ""))
+        doc_author = normalize(clean_author(doc.get("authorInfo", "")))
         if not doc_title:
             continue
 
@@ -197,6 +208,10 @@ def match_book(title: str, author: str, docs: list):
                 score += 2
             else:
                 score -= 1  # 저자 불일치 감점(오타/다른 책 방지)
+
+        # ISBN이 있는 항목을 우선(동점일 때 종이책 우선) — 필수는 아님
+        if str(doc.get("isbn", "")).strip():
+            score += 1
 
         if score > best_score:
             best_doc, best_score = doc, score
@@ -222,10 +237,10 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
     success = doc is not None and score >= 1
 
     if success:
-        clean_title = str(doc.get("title_info", title)).strip()
-        clean_auth = clean_author(doc.get("author_info", author)) or str(author).strip()
+        clean_title = strip_html(doc.get("titleInfo", title)) or str(title).strip()
+        clean_auth = clean_author(doc.get("authorInfo", author)) or str(author).strip()
         isbn = str(doc.get("isbn", "")).strip()
-        publisher = str(doc.get("pub_info", "")).strip()
+        publisher = strip_html(doc.get("pubInfo", "")).strip()
         return {
             "검증결과": "성공",
             "정제된 도서정보": f"{clean_title} ({clean_auth})",
@@ -335,8 +350,9 @@ def main():
                     st.success(f"성공! 검색 결과 {len(test['docs'])}건을 받았습니다.")
                     sample = test["docs"][0]
                     st.caption(
-                        f"예: {sample.get('title_info', '?')} / "
-                        f"{sample.get('author_info', '?')} / ISBN {sample.get('isbn', '없음')}"
+                        f"예: {strip_html(sample.get('titleInfo', '?'))} / "
+                        f"{clean_author(sample.get('authorInfo', '?'))} / "
+                        f"ISBN {sample.get('isbn') or '없음'}"
                     )
                 else:
                     st.warning("호출은 됐지만 결과가 0건입니다.")
