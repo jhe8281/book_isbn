@@ -79,15 +79,26 @@ def clean_author(author_raw: str) -> str:
 # ---------------------------------------------------------------------------
 # 국립중앙도서관 API 연동
 # ---------------------------------------------------------------------------
+ERROR_CODE_MEANING = {
+    "000": "시스템 오류",
+    "010": "인증키 누락",
+    "011": "유효하지 않은 인증키(승인 여부 확인 필요)",
+    "012": "필수 파라미터 누락",
+}
+
+
 @st.cache_data(show_spinner=False)
-def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> list:
+def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dict:
     """
-    제목으로 서지정보를 검색하여 docs(list)를 반환.
-    네트워크/파싱 오류 시 빈 리스트 반환.
+    제목으로 서지정보를 검색.
+    반환 dict:
+      - docs:  list  (검색 결과)
+      - error: str | None  (호출/인증 오류 메시지. 미등재가 아니라 '호출 실패'일 때만 채워짐)
+      - raw:   str  (디버그용 응답 원문 일부)
     cache_data 로 동일 (title, cert_key) 조합은 재호출하지 않음.
     """
     if not title or not str(title).strip():
-        return []
+        return {"docs": [], "error": None, "raw": ""}
 
     url = FALLBACK_URL if use_fallback else API_URL
     params = {
@@ -100,12 +111,25 @@ def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> lis
     try:
         resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
+        raw = resp.text[:800]
         data = resp.json()
-    except (requests.RequestException, ValueError):
-        return []
+    except requests.RequestException as e:
+        return {"docs": [], "error": f"네트워크 오류: {e}", "raw": ""}
+    except ValueError:
+        # JSON이 아님 → 보통 인증 오류 안내 페이지가 돌아온 경우
+        return {"docs": [], "error": "응답을 해석할 수 없습니다(인증키/주소 확인).", "raw": resp.text[:800]}
+
+    # 공식 에러코드 처리 (ERROR_CODE / ERROR_MSG 등 다양한 키 대비)
+    code = str(
+        data.get("ERROR_CODE") or data.get("error_code") or data.get("CODE") or ""
+    ).strip()
+    if code and code in ERROR_CODE_MEANING:
+        return {"docs": [], "error": f"[{code}] {ERROR_CODE_MEANING[code]}", "raw": raw}
 
     docs = data.get("docs", [])
-    return docs if isinstance(docs, list) else []
+    if not isinstance(docs, list):
+        docs = []
+    return {"docs": docs, "error": None, "raw": raw}
 
 
 def match_book(title: str, author: str, docs: list):
@@ -155,10 +179,19 @@ def match_book(title: str, author: str, docs: list):
 
 def verify_row(title: str, author: str, cert_key: str, use_fallback: bool) -> dict:
     """한 행(도서)을 검증하여 결과 dict 반환."""
-    docs = call_seoji_api(title, cert_key, use_fallback)
-    doc, score = match_book(title, author, docs)
+    res = call_seoji_api(title, cert_key, use_fallback)
 
-    # 저자가 입력된 경우 저자까지 어느 정도 맞아야 성공으로 인정(score 기준)
+    # 호출/인증 자체가 실패한 경우 → '미등재'와 구분해서 표시
+    if res["error"]:
+        return {
+            "검증결과": "오류",
+            "정제된 도서정보": f"API 호출 오류: {res['error']}",
+            "ISBN": "",
+            "출판사": "",
+        }
+
+    docs = res["docs"]
+    doc, score = match_book(title, author, docs)
     success = doc is not None and score >= 1 and str(doc.get("EA_ISBN", "")).strip()
 
     if success:
@@ -264,6 +297,22 @@ def main():
             "대체 엔드포인트(landingPage) 사용", value=False,
             help="기본 주소로 접속이 안 될 때 체크하세요.",
         )
+
+        st.markdown("---")
+        if st.button("🔌 연결 테스트"):
+            if not cert_key:
+                st.error("먼저 인증키를 입력하세요.")
+            else:
+                # 반드시 등재되어 있는 책으로 테스트
+                test = call_seoji_api("데미안", cert_key, use_fallback)
+                if test["error"]:
+                    st.error(f"실패: {test['error']}")
+                    st.caption("→ 키가 틀렸거나 아직 담당자 승인 전일 가능성이 큽니다.")
+                elif test["docs"]:
+                    st.success(f"성공! 검색 결과 {len(test['docs'])}건을 받았습니다.")
+                else:
+                    st.warning("호출은 됐지만 결과가 0건입니다. 잠시 후 다시 시도해 보세요.")
+
         st.markdown("---")
         st.markdown(
             "**인증키 발급:** 국립중앙도서관 서지정보 "
@@ -346,6 +395,17 @@ def main():
 
         success_cnt = int((result_df["검증결과"] == "성공").sum())
         fail_cnt = int((result_df["검증결과"] == "실패").sum())
+        error_cnt = int((result_df["검증결과"] == "오류").sum())
+
+        # API 오류가 많으면(특히 전부) 키/승인 문제일 가능성이 큼 → 먼저 경고
+        if error_cnt and error_cnt >= total * 0.5:
+            first_err = result_df.loc[result_df["검증결과"] == "오류", "정제된 도서정보"].iloc[0]
+            st.error(
+                "대부분의 항목이 API 호출 단계에서 막혔습니다. "
+                "도서 문제가 아니라 인증키 문제일 가능성이 큽니다.\n\n"
+                f"첫 오류 메시지: {first_err}"
+            )
+            st.caption("좌측 사이드바의 '🔌 연결 테스트'로 키 상태를 먼저 확인해 보세요.")
 
         # --- 통계 ---
         st.subheader("📊 검증 통계")
@@ -353,8 +413,7 @@ def main():
         m1.metric("전체", f"{total} 건")
         m2.metric("성공 ✅", f"{success_cnt} 건")
         m3.metric("실패 ❌", f"{fail_cnt} 건")
-        rate = (success_cnt / total * 100) if total else 0
-        m4.metric("성공률", f"{rate:.1f}%")
+        m4.metric("오류 ⚠️", f"{error_cnt} 건")
 
         # --- 결과 표 ---
         st.subheader("📋 검증 결과")
