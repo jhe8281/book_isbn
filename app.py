@@ -24,14 +24,12 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------------------
 # 상수 / 설정
 # ---------------------------------------------------------------------------
-API_URL = "https://www.nl.go.kr/seoji/SearchApi.do"
-# 참고: 문서상 엔드포인트는 http://seoji.nl.go.kr/landingPage/SearchApi.do 이며,
-# 위 https 주소도 동일 API로 동작합니다. 환경에 따라 아래 FALLBACK_URL을 사용하세요.
-FALLBACK_URL = "http://seoji.nl.go.kr/landingPage/SearchApi.do"
+API_URL = "https://www.nl.go.kr/NL/search/openApi/search.do"
 
 ERROR_MESSAGE = "오류: ISBN 미등재 또는 도서 정보 불일치"
-REQUEST_TIMEOUT = 10          # API 요청 타임아웃(초)
-REQUEST_DELAY = 0.2           # 호출 간 대기(초) - 과도한 요청 방지
+REQUEST_TIMEOUT = 30          # API 요청 타임아웃(초) - 서버가 느릴 때 대비
+REQUEST_RETRIES = 3           # 타임아웃 시 자동 재시도 횟수
+REQUEST_DELAY = 0.3           # 호출 간 대기(초) - 과도한 요청 방지
 PAGE_SIZE = 10                # API 검색 결과 페이지 크기
 
 st.set_page_config(page_title="독서기록 ISBN 검증 대시보드", page_icon="📚", layout="wide")
@@ -87,48 +85,81 @@ ERROR_CODE_MEANING = {
 }
 
 
+def extract_records(data) -> list:
+    """JSON 응답에서 도서 레코드 리스트를 견고하게 찾아낸다."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("result", "docs", "items", "list", "RESULT", "resultList"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return v
+    # 못 찾으면: 값들 중 dict들의 리스트를 결과로 간주
+    for v in data.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    return []
+
+
 @st.cache_data(show_spinner=False)
 def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dict:
     """
-    제목으로 서지정보를 검색.
+    제목으로 국립중앙도서관 소장자료를 검색.
     반환 dict:
-      - docs:  list  (검색 결과)
+      - docs:  list  (검색 결과 레코드)
       - error: str | None  (호출/인증 오류 메시지. 미등재가 아니라 '호출 실패'일 때만 채워짐)
       - raw:   str  (디버그용 응답 원문 일부)
-    cache_data 로 동일 (title, cert_key) 조합은 재호출하지 않음.
     """
     if not title or not str(title).strip():
         return {"docs": [], "error": None, "raw": ""}
 
-    url = FALLBACK_URL if use_fallback else API_URL
     params = {
-        "cert_key": cert_key,
-        "result_style": "json",
-        "page_no": 1,
-        "page_size": PAGE_SIZE,
-        "title": str(title).strip(),
+        "key": cert_key,
+        "apiType": "json",
+        "srchTarget": "title",      # 제목 기준 검색
+        "kwd": str(title).strip(),  # 검색어
+        "category": "도서",
+        "pageNum": 1,
+        "pageSize": PAGE_SIZE,
     }
-    try:
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.text[:800]
-        data = resp.json()
-    except requests.RequestException as e:
-        return {"docs": [], "error": f"네트워크 오류: {e}", "raw": ""}
-    except ValueError:
-        # JSON이 아님 → 보통 인증 오류 안내 페이지가 돌아온 경우
-        return {"docs": [], "error": "응답을 해석할 수 없습니다(인증키/주소 확인).", "raw": resp.text[:800]}
+    headers = {"User-Agent": "Mozilla/5.0 (reading-checker)"}
 
-    # 공식 에러코드 처리 (ERROR_CODE / ERROR_MSG 등 다양한 키 대비)
+    last_err = None
+    raw = ""
+    data = None
+    for attempt in range(REQUEST_RETRIES):
+        try:
+            resp = requests.get(
+                API_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            raw = resp.text[:800]
+            data = resp.json()
+            last_err = None
+            break
+        except requests.exceptions.Timeout:
+            last_err = "서버 응답이 느립니다(시간 초과). 잠시 후 다시 시도됩니다."
+            time.sleep(1.0)  # 잠깐 쉬었다가 재시도
+            continue
+        except requests.RequestException as e:
+            return {"docs": [], "error": f"네트워크 오류: {e}", "raw": ""}
+        except ValueError:
+            # JSON이 아님 → 보통 인증 오류 안내 페이지가 돌아온 경우
+            return {"docs": [], "error": "응답을 해석할 수 없습니다(인증키/주소 확인).", "raw": raw}
+
+    if data is None:
+        return {"docs": [], "error": last_err or "알 수 없는 오류", "raw": ""}
+
+    # 공식 에러코드 처리
     code = str(
-        data.get("ERROR_CODE") or data.get("error_code") or data.get("CODE") or ""
-    ).strip()
+        data.get("ERR_CODE") or data.get("error_code")
+        or data.get("ERROR_CODE") or data.get("CODE") or ""
+    ).strip() if isinstance(data, dict) else ""
     if code and code in ERROR_CODE_MEANING:
         return {"docs": [], "error": f"[{code}] {ERROR_CODE_MEANING[code]}", "raw": raw}
 
-    docs = data.get("docs", [])
-    if not isinstance(docs, list):
-        docs = []
+    docs = extract_records(data)
     return {"docs": docs, "error": None, "raw": raw}
 
 
@@ -146,8 +177,8 @@ def match_book(title: str, author: str, docs: list):
 
     best_doc, best_score = None, 0
     for doc in docs:
-        doc_title = normalize(doc.get("TITLE", ""))
-        doc_author = normalize(clean_author(doc.get("AUTHOR", "")))
+        doc_title = normalize(doc.get("title_info", ""))
+        doc_author = normalize(clean_author(doc.get("author_info", "")))
         if not doc_title:
             continue
 
@@ -167,19 +198,15 @@ def match_book(title: str, author: str, docs: list):
             else:
                 score -= 1  # 저자 불일치 감점(오타/다른 책 방지)
 
-        # ISBN이 있어야 정식 등재로 인정
-        if not str(doc.get("EA_ISBN", "")).strip():
-            score -= 2
-
         if score > best_score:
             best_doc, best_score = doc, score
 
     return best_doc, best_score
 
 
-def verify_row(title: str, author: str, cert_key: str, use_fallback: bool) -> dict:
+def verify_row(title: str, author: str, cert_key: str) -> dict:
     """한 행(도서)을 검증하여 결과 dict 반환."""
-    res = call_seoji_api(title, cert_key, use_fallback)
+    res = call_seoji_api(title, cert_key)
 
     # 호출/인증 자체가 실패한 경우 → '미등재'와 구분해서 표시
     if res["error"]:
@@ -192,13 +219,13 @@ def verify_row(title: str, author: str, cert_key: str, use_fallback: bool) -> di
 
     docs = res["docs"]
     doc, score = match_book(title, author, docs)
-    success = doc is not None and score >= 1 and str(doc.get("EA_ISBN", "")).strip()
+    success = doc is not None and score >= 1
 
     if success:
-        clean_title = str(doc.get("TITLE", title)).strip()
-        clean_auth = clean_author(doc.get("AUTHOR", author)) or str(author).strip()
-        isbn = str(doc.get("EA_ISBN", "")).strip()
-        publisher = str(doc.get("PUBLISHER", "")).strip()
+        clean_title = str(doc.get("title_info", title)).strip()
+        clean_auth = clean_author(doc.get("author_info", author)) or str(author).strip()
+        isbn = str(doc.get("isbn", "")).strip()
+        publisher = str(doc.get("pub_info", "")).strip()
         return {
             "검증결과": "성공",
             "정제된 도서정보": f"{clean_title} ({clean_auth})",
@@ -288,35 +315,40 @@ def main():
         else:
             # 저장된 키가 없을 때만 직접 입력받음(비밀번호 형태로 가려짐)
             cert_key = st.text_input(
-                "국립중앙도서관 인증키 (cert_key)",
+                "국립중앙도서관 발급키 (key)",
                 value="",
                 type="password",
-                help="배포 시에는 Secrets에 등록하면 이 칸이 사라집니다.",
+                help="소장자료 Open API 발급키를 입력하세요. 배포 시 Secrets에 넣으면 이 칸이 사라집니다.",
             ).strip()
-        use_fallback = st.checkbox(
-            "대체 엔드포인트(landingPage) 사용", value=False,
-            help="기본 주소로 접속이 안 될 때 체크하세요.",
-        )
 
         st.markdown("---")
         if st.button("🔌 연결 테스트"):
             if not cert_key:
-                st.error("먼저 인증키를 입력하세요.")
+                st.error("먼저 발급키를 입력하세요.")
             else:
-                # 반드시 등재되어 있는 책으로 테스트
-                test = call_seoji_api("데미안", cert_key, use_fallback)
+                # 반드시 소장되어 있는 책으로 테스트
+                test = call_seoji_api("토지", cert_key)
                 if test["error"]:
                     st.error(f"실패: {test['error']}")
-                    st.caption("→ 키가 틀렸거나 아직 담당자 승인 전일 가능성이 큽니다.")
+                    st.caption("→ 키가 틀렸거나 아직 승인 전일 가능성이 큽니다.")
                 elif test["docs"]:
                     st.success(f"성공! 검색 결과 {len(test['docs'])}건을 받았습니다.")
+                    sample = test["docs"][0]
+                    st.caption(
+                        f"예: {sample.get('title_info', '?')} / "
+                        f"{sample.get('author_info', '?')} / ISBN {sample.get('isbn', '없음')}"
+                    )
                 else:
-                    st.warning("호출은 됐지만 결과가 0건입니다. 잠시 후 다시 시도해 보세요.")
+                    st.warning("호출은 됐지만 결과가 0건입니다.")
+                # 응답 원문(문제 진단용)
+                if test.get("raw"):
+                    with st.expander("응답 원문 보기(진단용)"):
+                        st.code(test["raw"], language="json")
 
         st.markdown("---")
         st.markdown(
-            "**인증키 발급:** 국립중앙도서관 서지정보 "
-            "[오픈API](https://www.nl.go.kr/NL/contents/N31101030700.do) 신청"
+            "**발급키 안내:** 국립중앙도서관 "
+            "[Open API](https://www.nl.go.kr/NL/contents/N31101010000.do) 신청·관리"
         )
 
     # --- 파일 업로드 ---
@@ -378,7 +410,7 @@ def main():
         for idx, row in df.iterrows():
             title = row[title_col]
             author = "" if author_col == "(없음)" else row[author_col]
-            res = verify_row(title, author, cert_key, use_fallback)
+            res = verify_row(title, author, cert_key)
             results.append(res)
 
             done = (len(results)) / total
