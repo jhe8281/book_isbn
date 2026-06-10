@@ -76,11 +76,20 @@ def get_stored_key() -> str:
 
 # 저자(author) 역할어와 비저자(translator/editor 등) 역할어
 _AUTHOR_ROLES = ["지은이", "지음", "저자", "원작", "공저", "글", "著", "저"]
-_OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "譯", "역", "펴낸이", "엮은이", "엮음",
-                "그린이", "그림", "삽화", "사진", "편집", "곁텍스트", "감수", "구성",
-                "편저", "편", "감독", "기획", "해설"]
+_OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "영역", "한역", "譯", "역",
+                "펴낸이", "엮은이", "엮음", "일러스트", "그린이", "그림", "삽화",
+                "사진", "편집", "곁텍스트", "감수", "구성", "편저", "편", "감독",
+                "기획", "해설", "캘리그래피"]
 _ALL_ROLES = sorted(_AUTHOR_ROLES + _OTHER_ROLES, key=len, reverse=True)
 _ROLE_SPLIT_RE = re.compile(r"(.+?)\s*(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=\s|$)")
+_HAS_COLON_ROLE_RE = re.compile(r"[^\s:：]+\s*[:：]")
+
+
+def _is_author_role(role: str) -> bool:
+    """역할어 문자열이 '저자'에 해당하는지 판정(번역/삽화 등은 제외)."""
+    if any(o in role for o in _OTHER_ROLES):
+        return False
+    return any(a in role for a in _AUTHOR_ROLES)
 
 
 def _clean_name(nm: str) -> str:
@@ -96,11 +105,10 @@ def _clean_name(nm: str) -> str:
 
 def clean_author(author_raw: str) -> str:
     """
-    저자 필드를 사람이 읽기 좋은 형태로 정리.
-      - '이름 역할 이름 역할 …' 구조에서 저자 역할(지은이/지음/著 등)만 추출
-      - 옮긴이/펴낸이/엮은이/그린이 등은 제외
-      - 생몰년[..] 제거, '성, 이름' → '이름 성'
-      - 저자가 여러 명이면 '첫번째저자 외 N인'
+    저자 필드를 사람이 읽기 좋은 형태로 정리. 두 가지 표기를 모두 처리.
+      (A) '이름 역할 이름 역할 …'      예) Hesse, Hermann 지은이 …
+      (B) '역할: 이름 ; 역할: 이름 …'  예) 지은이: 생텍쥐페리 ;영역: 제니 박 …
+    저자 역할(지은이/지음/글 등)만 남기고, 여러 명이면 '첫저자 외 N인'.
     """
     if not author_raw:
         return ""
@@ -108,18 +116,37 @@ def clean_author(author_raw: str) -> str:
 
     authors = []
     matched = False
-    for m in _ROLE_SPLIT_RE.finditer(s):
-        matched = True
-        name, role = m.group(1).strip(), m.group(2)
-        if role in _OTHER_ROLES:               # 번역/출판/삽화 등은 저자 아님
-            continue
-        nm = _clean_name(name)
-        if nm:
-            authors.append(nm)
+
+    if _HAS_COLON_ROLE_RE.search(s):
+        # (B) 역할: 이름 형식 — ';' 또는 '/'로 그룹 구분
+        for group in re.split(r"[;/]", s):
+            group = group.strip()
+            if not group:
+                continue
+            mm = re.match(r"\s*([^:：]+)[:：]\s*(.+)$", group)
+            if not mm:
+                continue
+            matched = True
+            role, names = mm.group(1).strip(), mm.group(2).strip()
+            if not _is_author_role(role):
+                continue
+            for nm in re.split(r"\s*[,·]\s*", names):   # 공동저자 분리
+                nm = _clean_name(nm)
+                if nm:
+                    authors.append(nm)
+    else:
+        # (A) 이름 역할 형식
+        for m in _ROLE_SPLIT_RE.finditer(s):
+            matched = True
+            name, role = m.group(1).strip(), m.group(2)
+            if not _is_author_role(role):
+                continue
+            nm = _clean_name(name)
+            if nm:
+                authors.append(nm)
 
     if not matched:                            # 역할어가 전혀 없으면 통째로 정리
-        only = _clean_name(s)
-        return only
+        return _clean_name(s)
 
     # 중복 제거(순서 유지)
     seen, uniq = set(), []
@@ -503,7 +530,15 @@ def main():
             "**발급키 안내:** 국립중앙도서관 "
             "[Open API](https://www.nl.go.kr/NL/contents/N31101010000.do) 신청·관리"
         )
-        st.caption("made by 임지환 with Claude")
+        st.markdown(
+            "<div style='margin-top:14px;padding:10px 12px;border-radius:10px;"
+            "background:linear-gradient(135deg,#2E75B6,#5B9BD5);text-align:center;'>"
+            "<span style='color:#FFFFFF;font-weight:800;font-size:15px;letter-spacing:.3px;'>"
+            "made by 임지환</span>"
+            "<span style='color:#E6F0FA;font-weight:500;font-size:13px;'> with Claude</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     # --- 본문: 두 가지 입력 방식 ---
     tab_excel, tab_paste = st.tabs(["📂 엑셀 업로드", "✍️ 직접 입력"])
