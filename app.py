@@ -74,15 +74,32 @@ def get_stored_key() -> str:
     return os.environ.get("NL_API_KEY", "").strip()
 
 
-_TRANSLATOR_RE = re.compile(r"(옮긴이|옮김|역자|번역|그림|삽화|사진|편집)")
-_ROLE_WORDS_RE = re.compile(r"(지은이|지음|엮은이|엮음|편저|저자|원작|공저|감독|글)\s*[:：]?")
+# 저자(author) 역할어와 비저자(translator/editor 등) 역할어
+_AUTHOR_ROLES = ["지은이", "지음", "저자", "원작", "공저", "글", "著", "저"]
+_OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "譯", "역", "펴낸이", "엮은이", "엮음",
+                "그린이", "그림", "삽화", "사진", "편집", "곁텍스트", "감수", "구성",
+                "편저", "편", "감독", "기획", "해설"]
+_ALL_ROLES = sorted(_AUTHOR_ROLES + _OTHER_ROLES, key=len, reverse=True)
+_ROLE_SPLIT_RE = re.compile(r"(.+?)\s*(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=\s|$)")
+
+
+def _clean_name(nm: str) -> str:
+    """이름 하나를 정리: 생몰년[..] 제거, '성, 이름' → '이름 성'."""
+    nm = re.sub(r"\[[^\]]*\]", "", nm)          # [1877-1962] 등 제거
+    nm = re.sub(r"\s+", " ", nm).strip(" .,")
+    if "," in nm:                                # 'Hesse, Hermann' / '헤세, 헤르만'
+        parts = [p.strip() for p in nm.split(",") if p.strip()]
+        if len(parts) == 2:
+            nm = f"{parts[1]} {parts[0]}".strip()
+    return nm.strip()
 
 
 def clean_author(author_raw: str) -> str:
     """
     저자 필드를 사람이 읽기 좋은 형태로 정리.
-      - HTML 태그/역할어(지음, 저자 등) 제거
-      - 옮긴이/그림 등 번역·삽화자는 제외
+      - '이름 역할 이름 역할 …' 구조에서 저자 역할(지은이/지음/著 등)만 추출
+      - 옮긴이/펴낸이/엮은이/그린이 등은 제외
+      - 생몰년[..] 제거, '성, 이름' → '이름 성'
       - 저자가 여러 명이면 '첫번째저자 외 N인'
     """
     if not author_raw:
@@ -90,17 +107,19 @@ def clean_author(author_raw: str) -> str:
     s = strip_html(author_raw)
 
     authors = []
-    for seg in re.split(r"[;/]", s):           # 역할 그룹 구분
-        seg = seg.strip()
-        if not seg:
+    matched = False
+    for m in _ROLE_SPLIT_RE.finditer(s):
+        matched = True
+        name, role = m.group(1).strip(), m.group(2)
+        if role in _OTHER_ROLES:               # 번역/출판/삽화 등은 저자 아님
             continue
-        if _TRANSLATOR_RE.search(seg):         # 번역/삽화자 제외
-            continue
-        seg = _ROLE_WORDS_RE.sub("", seg).strip()
-        for nm in re.split(r"\s*[,·]\s*", seg):  # 한 그룹 안 공동저자 분리
-            nm = nm.strip()
-            if nm:
-                authors.append(nm)
+        nm = _clean_name(name)
+        if nm:
+            authors.append(nm)
+
+    if not matched:                            # 역할어가 전혀 없으면 통째로 정리
+        only = _clean_name(s)
+        return only
 
     # 중복 제거(순서 유지)
     seen, uniq = set(), []
@@ -111,7 +130,7 @@ def clean_author(author_raw: str) -> str:
     authors = uniq
 
     if not authors:
-        return s.strip()
+        return ""
     if len(authors) == 1:
         return authors[0]
     return f"{authors[0]} 외 {len(authors) - 1}인"
@@ -241,9 +260,9 @@ def match_book(title: str, author: str, docs: list):
             else:
                 score -= 1  # 저자 불일치 감점(오타/다른 책 방지)
 
-        # ISBN이 있는 항목을 우선(동점일 때 종이책 우선) — 필수는 아님
+        # ISBN(주로 정식 출판본)이 있는 항목을 강하게 우선
         if str(doc.get("isbn", "")).strip():
-            score += 1
+            score += 3
 
         if score > best_score:
             best_doc, best_score = doc, score
@@ -270,9 +289,14 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
 
     if success:
         clean_title = strip_html(doc.get("titleInfo", title)) or str(title).strip()
-        clean_auth = clean_author(doc.get("authorInfo", author)) or str(author).strip()
+        # 표시 저자: 사용자가 입력한 저자(보통 한글)가 있으면 그대로 사용,
+        # 없으면 API 저자를 정리해서 사용(로마자만 있을 수 있음)
+        provided = str(author).strip()
+        clean_auth = provided if provided else clean_author(doc.get("authorInfo", ""))
+        if not clean_auth:
+            clean_auth = "저자 미상"
         isbn = str(doc.get("isbn", "")).strip()
-        publisher = strip_html(doc.get("pubInfo", "")).strip()
+        publisher = strip_html(doc.get("pubInfo", "")).strip().rstrip(" :,")
         return {
             "검증결과": "성공",
             "정제된 도서정보": f"{clean_title}({clean_auth})",
@@ -479,6 +503,7 @@ def main():
             "**발급키 안내:** 국립중앙도서관 "
             "[Open API](https://www.nl.go.kr/NL/contents/N31101010000.do) 신청·관리"
         )
+        st.caption("made by 임지환 with Claude")
 
     # --- 본문: 두 가지 입력 방식 ---
     tab_excel, tab_paste = st.tabs(["📂 엑셀 업로드", "✍️ 직접 입력"])
