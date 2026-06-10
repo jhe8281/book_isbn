@@ -342,13 +342,94 @@ def build_excel(df: pd.DataFrame) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# 직접 입력 파싱 + 공통 검증 처리
+# ---------------------------------------------------------------------------
+def parse_pasted(text: str) -> pd.DataFrame:
+    """
+    여러 줄 텍스트를 (책 제목, 저자) 표로 변환.
+    한 줄에 제목과 저자를 탭 또는 쉼표로 구분(저자는 생략 가능).
+      예) 데미안, 헤르만 헤세
+          토지<TAB>박경리
+          어린 왕자
+    """
+    rows = []
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"[\t,]", line, maxsplit=1)
+        title = parts[0].strip()
+        author = parts[1].strip() if len(parts) > 1 else ""
+        if title:
+            rows.append({"책 제목": title, "저자": author})
+    return pd.DataFrame(rows)
+
+
+def run_verification(df, title_col, author_col, cert_key, key_suffix):
+    """검증 루프 → 통계 → 결과 표 → 엑셀 다운로드. (두 탭에서 공통 사용)"""
+    if not cert_key:
+        st.error("먼저 좌측 사이드바에서 발급키를 입력해 주세요.")
+        return
+
+    total = len(df)
+    progress = st.progress(0.0, text="검증을 시작합니다...")
+    results = []
+    for _, row in df.iterrows():
+        title = row[title_col]
+        author = "" if (author_col is None or author_col == "(없음)") else row[author_col]
+        results.append(verify_row(title, author, cert_key))
+        progress.progress(
+            len(results) / total,
+            text=f"검증 중... ({len(results)}/{total})  현재: {str(title)[:20]}",
+        )
+        time.sleep(REQUEST_DELAY)
+    progress.empty()
+
+    result_df = pd.DataFrame(results, index=df.index)
+    merged = pd.concat([df, result_df], axis=1)
+
+    success_cnt = int((result_df["검증결과"] == "성공").sum())
+    fail_cnt = int((result_df["검증결과"] == "실패").sum())
+    error_cnt = int((result_df["검증결과"] == "오류").sum())
+
+    if error_cnt and error_cnt >= total * 0.5:
+        first_err = result_df.loc[result_df["검증결과"] == "오류", "정제된 도서정보"].iloc[0]
+        st.error(
+            "대부분의 항목이 API 호출 단계에서 막혔습니다. "
+            "도서 문제가 아니라 발급키 문제일 가능성이 큽니다.\n\n"
+            f"첫 오류 메시지: {first_err}"
+        )
+        st.caption("좌측 사이드바의 '🔌 연결 테스트'로 키 상태를 먼저 확인해 보세요.")
+
+    st.subheader("📊 검증 통계")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("전체", f"{total} 건")
+    m2.metric("성공 ✅", f"{success_cnt} 건")
+    m3.metric("실패 ❌", f"{fail_cnt} 건")
+    m4.metric("오류 ⚠️", f"{error_cnt} 건")
+
+    st.subheader("📋 검증 결과")
+    st.dataframe(merged, use_container_width=True)
+
+    st.download_button(
+        label="⬇️ 검증 결과 엑셀 다운로드",
+        data=build_excel(merged),
+        file_name="독서기록_검증결과.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        key=f"download_{key_suffix}",
+    )
+    st.success("검증이 완료되었습니다. 위 버튼으로 결과 파일을 내려받으세요.")
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 def main():
     st.title("📚 독서활동기록 ISBN 검증 대시보드")
     st.caption(
-        "학생 독서기록 엑셀을 업로드하면 국립중앙도서관 서지정보 API와 대조하여 "
-        "공식 등재 도서만 정제된 형태로 반환합니다."
+        "독서기록을 국립중앙도서관 소장자료 데이터베이스와 대조하여 "
+        "실제 도서만 정제된 형태로 정리합니다."
     )
 
     # --- 사이드바: API 키 및 옵션 ---
@@ -399,116 +480,74 @@ def main():
             "[Open API](https://www.nl.go.kr/NL/contents/N31101010000.do) 신청·관리"
         )
 
-    # --- 파일 업로드 ---
-    uploaded = st.file_uploader(
-        "독서기록 엑셀 파일 업로드 (.xlsx)", type=["xlsx"], accept_multiple_files=False
-    )
+    # --- 본문: 두 가지 입력 방식 ---
+    tab_excel, tab_paste = st.tabs(["📂 엑셀 업로드", "✍️ 직접 입력"])
 
-    if uploaded is None:
-        st.info("좌측 설정에서 인증키를 입력하고, 위에 엑셀 파일을 업로드해 주세요.")
-        return
-
-    # 엑셀 읽기
-    try:
-        df = pd.read_excel(uploaded)
-    except Exception as e:  # noqa: BLE001
-        st.error(f"엑셀을 읽는 중 오류가 발생했습니다: {e}")
-        return
-
-    if df.empty:
-        st.warning("업로드한 파일에 데이터가 없습니다.")
-        return
-
-    st.subheader("📄 업로드 데이터 미리보기")
-    st.dataframe(df.head(10), use_container_width=True)
-
-    # --- 열 매핑 ---
-    cols = list(df.columns)
-
-    def guess(candidates):
-        for i, c in enumerate(cols):
-            if any(k in str(c) for k in candidates):
-                return i
-        return 0
-
-    c1, c2 = st.columns(2)
-    with c1:
-        title_col = st.selectbox(
-            "‘책 제목’ 열 선택", cols, index=guess(["제목", "책", "도서", "title"])
+    # ===== 탭 1: 엑셀 업로드 =====
+    with tab_excel:
+        uploaded = st.file_uploader(
+            "독서기록 엑셀 파일 업로드 (.xlsx)", type=["xlsx"], accept_multiple_files=False
         )
-    with c2:
-        author_options = ["(없음)"] + cols
-        a_guess = guess(["저자", "작가", "author"])
-        author_col = st.selectbox(
-            "‘저자’ 열 선택 (선택)",
-            author_options,
-            index=(a_guess + 1) if a_guess else 0,
+        if uploaded is None:
+            st.info("좌측 설정에서 발급키를 확인하고, 위에 엑셀 파일을 업로드해 주세요.")
+        else:
+            try:
+                df = pd.read_excel(uploaded)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"엑셀을 읽는 중 오류가 발생했습니다: {e}")
+                df = None
+
+            if df is not None and df.empty:
+                st.warning("업로드한 파일에 데이터가 없습니다.")
+            elif df is not None:
+                st.subheader("📄 업로드 데이터 미리보기")
+                st.dataframe(df.head(10), use_container_width=True)
+
+                cols = list(df.columns)
+
+                def guess(candidates):
+                    for i, c in enumerate(cols):
+                        if any(k in str(c) for k in candidates):
+                            return i
+                    return 0
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    title_col = st.selectbox(
+                        "‘책 제목’ 열 선택", cols,
+                        index=guess(["제목", "책", "도서", "title"]),
+                    )
+                with c2:
+                    author_options = ["(없음)"] + cols
+                    a_guess = guess(["저자", "작가", "author"])
+                    author_col = st.selectbox(
+                        "‘저자’ 열 선택 (선택)", author_options,
+                        index=(a_guess + 1) if a_guess else 0,
+                    )
+
+                if st.button("🔍 ISBN 검증 시작", type="primary", key="verify_excel"):
+                    run_verification(df, title_col, author_col, cert_key, "excel")
+
+    # ===== 탭 2: 직접 입력 =====
+    with tab_paste:
+        st.caption(
+            "한 줄에 한 권씩 입력하세요. 제목과 저자는 쉼표(,)로 구분하며, 저자는 생략할 수 있습니다. "
+            "엑셀에서 제목·저자 두 열을 복사해 붙여넣어도 됩니다."
         )
-
-    # --- 검증 실행 ---
-    if st.button("🔍 ISBN 검증 시작", type="primary"):
-        if not cert_key:
-            st.error("먼저 좌측 사이드바에서 인증키(cert_key)를 입력해 주세요.")
-            return
-
-        total = len(df)
-        progress = st.progress(0.0, text="검증을 시작합니다...")
-        results = []
-
-        for idx, row in df.iterrows():
-            title = row[title_col]
-            author = "" if author_col == "(없음)" else row[author_col]
-            res = verify_row(title, author, cert_key)
-            results.append(res)
-
-            done = (len(results)) / total
-            progress.progress(
-                done, text=f"검증 중... ({len(results)}/{total})  현재: {str(title)[:20]}"
-            )
-            time.sleep(REQUEST_DELAY)
-
-        progress.empty()
-
-        # 결과 병합
-        result_df = pd.DataFrame(results, index=df.index)
-        merged = pd.concat([df, result_df], axis=1)
-
-        success_cnt = int((result_df["검증결과"] == "성공").sum())
-        fail_cnt = int((result_df["검증결과"] == "실패").sum())
-        error_cnt = int((result_df["검증결과"] == "오류").sum())
-
-        # API 오류가 많으면(특히 전부) 키/승인 문제일 가능성이 큼 → 먼저 경고
-        if error_cnt and error_cnt >= total * 0.5:
-            first_err = result_df.loc[result_df["검증결과"] == "오류", "정제된 도서정보"].iloc[0]
-            st.error(
-                "대부분의 항목이 API 호출 단계에서 막혔습니다. "
-                "도서 문제가 아니라 인증키 문제일 가능성이 큽니다.\n\n"
-                f"첫 오류 메시지: {first_err}"
-            )
-            st.caption("좌측 사이드바의 '🔌 연결 테스트'로 키 상태를 먼저 확인해 보세요.")
-
-        # --- 통계 ---
-        st.subheader("📊 검증 통계")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("전체", f"{total} 건")
-        m2.metric("성공 ✅", f"{success_cnt} 건")
-        m3.metric("실패 ❌", f"{fail_cnt} 건")
-        m4.metric("오류 ⚠️", f"{error_cnt} 건")
-
-        # --- 결과 표 ---
-        st.subheader("📋 검증 결과")
-        st.dataframe(merged, use_container_width=True)
-
-        # --- 엑셀 다운로드 ---
-        excel_bytes = build_excel(merged)
-        st.download_button(
-            label="⬇️ 검증 결과 엑셀 다운로드",
-            data=excel_bytes,
-            file_name="독서기록_검증결과.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
+        sample = "데미안, 헤르만 헤세\n어린 왕자, 생텍쥐페리\n토지, 박경리\n사피엔스"
+        text = st.text_area(
+            "도서 목록 붙여넣기",
+            height=200,
+            placeholder=sample,
+            key="paste_area",
         )
-        st.success("검증이 완료되었습니다. 위 버튼으로 결과 파일을 내려받으세요.")
+        if st.button("🔍 ISBN 검증 시작", type="primary", key="verify_paste"):
+            df_paste = parse_pasted(text)
+            if df_paste.empty:
+                st.warning("입력된 도서가 없습니다. 한 줄에 한 권씩 입력해 주세요.")
+            else:
+                st.caption(f"{len(df_paste)}권을 검증합니다.")
+                run_verification(df_paste, "책 제목", "저자", cert_key, "paste")
 
 
 if __name__ == "__main__":
