@@ -74,15 +74,47 @@ def get_stored_key() -> str:
     return os.environ.get("NL_API_KEY", "").strip()
 
 
+_TRANSLATOR_RE = re.compile(r"(옮긴이|옮김|역자|번역|그림|삽화|사진|편집)")
+_ROLE_WORDS_RE = re.compile(r"(지은이|지음|엮은이|엮음|편저|저자|원작|공저|감독|글)\s*[:：]?")
+
+
 def clean_author(author_raw: str) -> str:
-    """API의 저자 필드에서 HTML 태그와 '지은이', '저', ';' 등 부가 표기를 정리."""
+    """
+    저자 필드를 사람이 읽기 좋은 형태로 정리.
+      - HTML 태그/역할어(지음, 저자 등) 제거
+      - 옮긴이/그림 등 번역·삽화자는 제외
+      - 저자가 여러 명이면 '첫번째저자 외 N인'
+    """
     if not author_raw:
         return ""
     s = strip_html(author_raw)
-    # 첫 번째 구분자 이전의 대표 저자만 사용
-    s = re.split(r"[;,/]", s)[0]
-    s = re.sub(r"(지은이|옮긴이|저자|저|글|그림|편|역|엮음|원작|감독)\s*[:：]?", "", s)
-    return s.strip()
+
+    authors = []
+    for seg in re.split(r"[;/]", s):           # 역할 그룹 구분
+        seg = seg.strip()
+        if not seg:
+            continue
+        if _TRANSLATOR_RE.search(seg):         # 번역/삽화자 제외
+            continue
+        seg = _ROLE_WORDS_RE.sub("", seg).strip()
+        for nm in re.split(r"\s*[,·]\s*", seg):  # 한 그룹 안 공동저자 분리
+            nm = nm.strip()
+            if nm:
+                authors.append(nm)
+
+    # 중복 제거(순서 유지)
+    seen, uniq = set(), []
+    for a in authors:
+        if a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    authors = uniq
+
+    if not authors:
+        return s.strip()
+    if len(authors) == 1:
+        return authors[0]
+    return f"{authors[0]} 외 {len(authors) - 1}인"
 
 
 # ---------------------------------------------------------------------------
