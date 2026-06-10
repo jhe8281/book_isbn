@@ -81,7 +81,7 @@ _OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "영역", "한역", "
                 "사진", "편집", "곁텍스트", "감수", "구성", "편저", "편", "감독",
                 "기획", "해설", "캘리그래피"]
 _ALL_ROLES = sorted(_AUTHOR_ROLES + _OTHER_ROLES, key=len, reverse=True)
-_ROLE_SPLIT_RE = re.compile(r"(.+?)\s*(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=\s|$)")
+_ROLE_SPLIT_RE = re.compile(r"(.+?)\s*(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=[\s;,/]|$)")
 _HAS_COLON_ROLE_RE = re.compile(r"[^\s:：]+\s*[:：]")
 
 
@@ -95,7 +95,7 @@ def _is_author_role(role: str) -> bool:
 def _clean_name(nm: str) -> str:
     """이름 하나를 정리: 생몰년[..] 제거, '성, 이름' → '이름 성'."""
     nm = re.sub(r"\[[^\]]*\]", "", nm)          # [1877-1962] 등 제거
-    nm = re.sub(r"\s+", " ", nm).strip(" .,")
+    nm = re.sub(r"\s+", " ", nm).strip(" .,;/")
     if "," in nm:                                # 'Hesse, Hermann' / '헤세, 헤르만'
         parts = [p.strip() for p in nm.split(",") if p.strip()]
         if len(parts) == 2:
@@ -297,6 +297,30 @@ def match_book(title: str, author: str, docs: list):
     return best_doc, best_score
 
 
+def _matching_candidates(title, docs):
+    """제목이 일치하는 레코드들의 (저자) 후보 목록을 만든다.
+    같은 책의 중복 레코드는 controlNo/저자명으로 합치고, 저자 미상은 제외한다."""
+    n_title = normalize(title)
+    cands = []
+    seen_book = set()      # controlNo 기준 중복 책 제거
+    seen_author = set()    # 같은 저자명 중복 제거
+    for d in docs:
+        dt = normalize(d.get("titleInfo", ""))
+        if not dt or not (n_title in dt or dt in n_title):
+            continue
+        ctrl = str(d.get("controlNo", "")).strip()
+        if ctrl and ctrl in seen_book:
+            continue
+        a = clean_author(d.get("authorInfo", ""))
+        if not a or a in seen_author:
+            continue
+        if ctrl:
+            seen_book.add(ctrl)
+        seen_author.add(a)
+        cands.append(a)
+    return cands
+
+
 def verify_row(title: str, author: str, cert_key: str) -> dict:
     """한 행(도서)을 검증하여 결과 dict 반환."""
     res = call_seoji_api(title, cert_key)
@@ -308,6 +332,7 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
             "정제된 도서정보": f"API 호출 오류: {res['error']}",
             "ISBN": "",
             "출판사": "",
+            "다른 후보": "",
         }
 
     docs = res["docs"]
@@ -319,22 +344,29 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
         # 표시 저자: 사용자가 입력한 저자(보통 한글)가 있으면 그대로 사용,
         # 없으면 API 저자를 정리해서 사용(로마자만 있을 수 있음)
         provided = str(author).strip()
-        clean_auth = provided if provided else clean_author(doc.get("authorInfo", ""))
-        if not clean_auth:
-            clean_auth = "저자 미상"
+        api_auth = clean_author(doc.get("authorInfo", ""))
+        clean_auth = provided if provided else (api_auth or "저자 미상")
         isbn = str(doc.get("isbn", "")).strip()
         publisher = strip_html(doc.get("pubInfo", "")).strip().rstrip(" :,")
+
+        # 동명이서 후보: 선택된 저자(또는 표시 저자)와 다른 후보들만
+        chosen = {clean_auth, api_auth}
+        others = [c for c in _matching_candidates(title, docs) if c not in chosen]
+        others = others[:5]
+
         return {
             "검증결과": "성공",
             "정제된 도서정보": f"{clean_title}({clean_auth})",
             "ISBN": isbn,
             "출판사": publisher,
+            "다른 후보": " / ".join(others),
         }
     return {
         "검증결과": "실패",
         "정제된 도서정보": ERROR_MESSAGE,
         "ISBN": "",
         "출판사": "",
+        "다른 후보": "",
     }
 
 
@@ -541,7 +573,7 @@ def main():
         )
 
     # --- 본문: 두 가지 입력 방식 ---
-    tab_excel, tab_paste = st.tabs(["📂 엑셀 업로드", "✍️ 직접 입력"])
+    tab_paste, tab_excel = st.tabs(["✍️ 직접 입력", "📂 엑셀 업로드"])
 
     # ===== 탭 1: 엑셀 업로드 =====
     with tab_excel:
