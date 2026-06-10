@@ -275,7 +275,7 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
         publisher = strip_html(doc.get("pubInfo", "")).strip()
         return {
             "검증결과": "성공",
-            "정제된 도서정보": f"{clean_title} ({clean_auth})",
+            "정제된 도서정보": f"{clean_title}({clean_auth})",
             "ISBN": isbn,
             "출판사": publisher,
         }
