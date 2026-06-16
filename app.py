@@ -49,15 +49,29 @@ def strip_html(text) -> str:
     return s.strip()
 
 
-def strip_subtitle(title: str) -> str:
-    """제목에서 부제(콜론 ' : ' 뒤)를 제거해 원제만 남긴다.
-    예) '페인트 : 이희영 장편소설' → '페인트'
-        '라일락 피면 : 10대의 …'   → '라일락 피면'
+def display_title(title: str) -> str:
+    """화면 표시용 제목: 괄호는 그대로 두고, 콜론(:) 부제만 제거.
+    예) '(영원한 라이벌) 김대중 VS 김영삼' → 그대로
+        '페인트 : 이희영 장편소설'         → '페인트'
     """
     s = strip_html(title)
-    # 전각/반각 콜론 기준으로 앞부분만 사용
     s = re.split(r"\s*[:：]\s*", s)[0]
-    return s.strip()
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def strip_subtitle(title: str) -> str:
+    """제목에서 괄호 묶음과 부제(콜론 ' : ' 뒤)를 제거해 원제만 남긴다.
+    예) '페인트 : 이희영 장편소설'        → '페인트'
+        '(영원한 라이벌) 김대중 VS 김영삼' → '김대중 VS 김영삼'
+        '어린왕자 (The Little Prince)'     → '어린왕자'
+    """
+    s = strip_html(title)
+    # 괄호 묶음 제거: ( ), [ ], （ ）, ［ ］, 〔 〕, 《 》, < >
+    s = re.sub(r"[\(\[（［〔《〈<][^)\]）］〕》〉>]*[\)\]）］〕》〉>]", " ", s)
+    # 콜론 부제 제거
+    s = re.split(r"\s*[:：]\s*", s)[0]
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _title_key(t: str) -> str:
@@ -317,10 +331,14 @@ def match_book(title: str, author: str, docs: list):
 
         # 저자 일치 판정 (입력 저자가 있을 때만 평가)
         if n_author:
-            if n_author in doc_author or doc_author in n_author:
+            if doc_author and (n_author in doc_author or doc_author in n_author):
                 score += 3
             else:
                 score -= 2  # 저자 불일치 감점
+
+        # 저자 정보가 아예 없는 판본은 후순위로(‘저자 미상’ 방지)
+        if not doc_author:
+            score -= 3
 
         # ISBN 보유 가산점(정확일치보다 약하게)
         if str(doc.get("EA_ISBN", "")).strip():
@@ -369,11 +387,23 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
         }
 
     docs = res["docs"]
+    eff_title = title
     doc, score = match_book(title, author, docs)
     success = doc is not None and score >= 1
 
+    # 콤마가 제목의 일부였을 가능성: '제목, 저자'로 잘못 쪼개졌다면
+    # 둘을 합쳐 통째 제목으로 한 번 더 검색해 본다.
+    if not success and str(author).strip():
+        combined = f"{title} {author}".strip()
+        res2 = call_seoji_api(combined, cert_key)
+        if not res2["error"]:
+            doc2, score2 = match_book(combined, "", res2["docs"])
+            if doc2 is not None and score2 >= 1:
+                doc, score, docs, eff_title = doc2, score2, res2["docs"], combined
+                success = True
+
     if success:
-        clean_title = strip_subtitle(doc.get("TITLE", title)) or str(title).strip()
+        clean_title = display_title(doc.get("TITLE", eff_title)) or str(eff_title).strip()
         # 표시 저자: 서지정보 DB의 정제된 저자를 기본으로 사용.
         # (입력 저자는 '검색 정확도'를 높이는 데만 쓰고, 표시에는 그대로 쓰지 않음)
         api_auth = clean_author(doc.get("AUTHOR", ""))
@@ -382,7 +412,7 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
         publisher = strip_html(doc.get("PUBLISHER", "")).strip().rstrip(" :,")
 
         # 동명이서 후보: 선택된 저자와 다른 후보들만
-        others = [c for c in _matching_candidates(title, docs) if c != clean_auth]
+        others = [c for c in _matching_candidates(eff_title, docs) if c != clean_auth]
         others = others[:5]
 
         return {
