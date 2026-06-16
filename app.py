@@ -488,14 +488,6 @@ def build_excel(df: pd.DataFrame) -> bytes:
 # ---------------------------------------------------------------------------
 # 직접 입력 파싱 + 공통 검증 처리
 # ---------------------------------------------------------------------------
-def parse_pasted(text: str) -> pd.DataFrame:
-    """
-    여러 줄 텍스트를 (책 제목, 저자) 표로 변환.
-    한 줄에 제목과 저자를 탭 또는 쉼표로 구분(저자는 생략 가능).
-      예) 데미안, 헤르만 헤세
-          토지<TAB>박경리
-          어린 왕자
-    """
 def _looks_like_author(s: str) -> bool:
     """콤마 뒤 문자열이 '저자'처럼 보이는지(문장/부제가 아닌지) 판정."""
     s = s.strip()
@@ -513,11 +505,15 @@ def parse_pasted(text: str) -> pd.DataFrame:
     여러 줄 텍스트를 (책 제목, 저자) 표로 변환.
     구분 규칙(제목에 콤마가 들어간 책을 보호):
       1) 탭이 있으면 탭으로 제목/저자 구분 (엑셀에서 두 열 복사·붙여넣기)
-      2) 탭이 없고 콤마가 있으면, 콤마 뒤가 '저자처럼 보일 때만' 저자로 분리
+      2) 줄 끝이 '(저자)'로 끝나면 괄호 안을 저자로 분리
+         - 예) '커튼콜(조우리)' → 제목=커튼콜, 저자=조우리
+      3) 탭이 없고 콤마가 있으면, 콤마 뒤가 '저자처럼 보일 때만' 저자로 분리
          - 예) '데미안, 헤르만 헤세' → 제목=데미안, 저자=헤르만 헤세
          - 예) '진로를 정하지 못한 나, 비정상 인가요?' → 통째로 제목(저자 없음)
-      3) 그 외에는 한 줄 전체가 제목
+      4) 그 외에는 한 줄 전체가 제목
     """
+    paren_re = re.compile(r"^(.*\S)\s*[\(（]\s*([^()（）]+?)\s*[\)）]\s*$")
+
     rows = []
     for line in str(text).splitlines():
         line = line.strip()
@@ -529,11 +525,16 @@ def parse_pasted(text: str) -> pd.DataFrame:
             parts = line.split("\t", 1)
             title = parts[0].strip()
             author = parts[1].strip() if len(parts) > 1 else ""
-        elif "," in line:
-            head, tail = line.split(",", 1)
-            if _looks_like_author(tail):
-                title, author = head.strip(), tail.strip()
-            # 저자처럼 안 보이면 line 전체가 제목(기본값 유지)
+        else:
+            m = paren_re.match(line)
+            if m and _looks_like_author(m.group(2)):
+                # '제목(저자)' 형식
+                title, author = m.group(1).strip(), m.group(2).strip()
+            elif "," in line:
+                head, tail = line.split(",", 1)
+                if _looks_like_author(tail):
+                    title, author = head.strip(), tail.strip()
+                # 저자처럼 안 보이면 line 전체가 제목(기본값 유지)
 
         if title:
             rows.append({"책 제목": title, "저자": author})
@@ -716,11 +717,11 @@ def main():
     with tab_paste:
         st.caption(
             "한 줄에 한 권씩 입력하세요. 저자를 함께 적으면 같은 제목의 다른 책과 더 정확히 구분됩니다. "
-            "제목·저자는 쉼표(,)로 구분하며 저자는 생략할 수 있습니다. "
+            "‘제목(저자)’ 또는 ‘제목, 저자’ 형식 모두 가능하며 저자는 생략할 수 있습니다. "
             "제목에 쉼표·물음표가 들어간 책은 통째로 제목으로 처리되니, 그런 책은 엑셀에서 두 열을 복사해 "
             "붙여넣으면(탭 구분) 가장 정확합니다."
         )
-        sample = "데미안, 헤르만 헤세\n어린 왕자, 생텍쥐페리\n토지, 박경리\n사피엔스"
+        sample = "커튼콜(조우리)\n데미안, 헤르만 헤세\n어린 왕자\n소년이 온다(한강)"
         text = st.text_area(
             "도서 목록 붙여넣기",
             height=200,
