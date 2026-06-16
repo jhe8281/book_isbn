@@ -24,7 +24,7 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------------------
 # 상수 / 설정
 # ---------------------------------------------------------------------------
-API_URL = "https://www.nl.go.kr/NL/search/openApi/search.do"
+API_URL = "https://www.nl.go.kr/seoji/SearchApi.do"
 
 ERROR_MESSAGE = "오류: ISBN 미등재 또는 도서 정보 불일치"
 REQUEST_TIMEOUT = 30          # API 요청 타임아웃(초) - 서버가 느릴 때 대비
@@ -46,6 +46,17 @@ def strip_html(text) -> str:
     s = re.sub(r"<[^>]+>", "", s)           # 태그 제거
     s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     s = s.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+    return s.strip()
+
+
+def strip_subtitle(title: str) -> str:
+    """제목에서 부제(콜론 ' : ' 뒤)를 제거해 원제만 남긴다.
+    예) '페인트 : 이희영 장편소설' → '페인트'
+        '라일락 피면 : 10대의 …'   → '라일락 피면'
+    """
+    s = strip_html(title)
+    # 전각/반각 콜론 기준으로 앞부분만 사용
+    s = re.split(r"\s*[:：]\s*", s)[0]
     return s.strip()
 
 
@@ -114,7 +125,8 @@ def clean_author(author_raw: str) -> str:
         return ""
     s = strip_html(author_raw)
 
-    authors = []
+    authors = []   # 지은이/지음/글 등
+    others = []    # 엮음/옮김/펴낸이 등 (저자가 없을 때 대비)
     matched = False
 
     if _HAS_COLON_ROLE_RE.search(s):
@@ -128,39 +140,46 @@ def clean_author(author_raw: str) -> str:
                 continue
             matched = True
             role, names = mm.group(1).strip(), mm.group(2).strip()
-            if not _is_author_role(role):
-                continue
+            bucket = authors if _is_author_role(role) else others
             for nm in re.split(r"\s*[,·]\s*", names):   # 공동저자 분리
                 nm = _clean_name(nm)
                 if nm:
-                    authors.append(nm)
+                    bucket.append(nm)
     else:
         # (A) 이름 역할 형식
         for m in _ROLE_SPLIT_RE.finditer(s):
             matched = True
             name, role = m.group(1).strip(), m.group(2)
-            if not _is_author_role(role):
-                continue
+            bucket = authors if _is_author_role(role) else others
             nm = _clean_name(name)
             if nm:
-                authors.append(nm)
+                bucket.append(nm)
 
-    if not matched:                            # 역할어가 전혀 없으면 통째로 정리
+    if not matched:                            # 역할어가 전혀 없음
+        # '이름[생몰년] 이름[생몰년] …' 형태면 여러 명으로 보고 정리
+        bracket_names = [n.strip() for n in re.findall(r"([^\[\]\s][^\[\]]*?)\s*\[", s)]
+        bracket_names = [n for n in bracket_names if n]
+        if len(bracket_names) >= 2:
+            first = _clean_name(bracket_names[0])
+            return f"{first} 외 {len(bracket_names) - 1}인" if first else ""
         return _clean_name(s)
+
+    # 지은이가 없으면 엮은이/옮긴이 등 기타 기여자를 대신 사용(선집·번역서 등)
+    pool = authors if authors else others
 
     # 중복 제거(순서 유지)
     seen, uniq = set(), []
-    for a in authors:
+    for a in pool:
         if a not in seen:
             seen.add(a)
             uniq.append(a)
-    authors = uniq
+    pool = uniq
 
-    if not authors:
+    if not pool:
         return ""
-    if len(authors) == 1:
-        return authors[0]
-    return f"{authors[0]} 외 {len(authors) - 1}인"
+    if len(pool) == 1:
+        return pool[0]
+    return f"{pool[0]} 외 {len(pool) - 1}인"
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +213,7 @@ def extract_records(data) -> list:
 @st.cache_data(show_spinner=False)
 def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dict:
     """
-    제목으로 국립중앙도서관 소장자료를 검색.
+    제목으로 국립중앙도서관 서지정보(Seoji) DB를 검색.
     반환 dict:
       - docs:  list  (검색 결과 레코드)
       - error: str | None  (호출/인증 오류 메시지. 미등재가 아니라 '호출 실패'일 때만 채워짐)
@@ -204,13 +223,11 @@ def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dic
         return {"docs": [], "error": None, "raw": ""}
 
     params = {
-        "key": cert_key,
-        "apiType": "json",
-        "srchTarget": "title",      # 제목 기준 검색
-        "kwd": str(title).strip(),  # 검색어
-        "category": "도서",
-        "pageNum": 1,
-        "pageSize": PAGE_SIZE,
+        "cert_key": cert_key,
+        "result_style": "json",
+        "page_no": 1,
+        "page_size": PAGE_SIZE,
+        "title": str(title).strip(),
     }
     headers = {"User-Agent": "Mozilla/5.0 (reading-checker)"}
 
@@ -259,19 +276,19 @@ def match_book(title: str, author: str, docs: list):
       - 제목 일치(부분 포함)는 필수
       - 저자 일치 시 가중치 부여
     """
-    n_title = normalize(title)
+    n_title = normalize(strip_subtitle(title))
     n_author = normalize(author)
     if not n_title:
         return None, 0
 
     best_doc, best_score = None, 0
     for doc in docs:
-        doc_title = normalize(doc.get("titleInfo", ""))
-        doc_author = normalize(clean_author(doc.get("authorInfo", "")))
+        doc_title = normalize(strip_subtitle(doc.get("TITLE", "")))
+        doc_author = normalize(clean_author(doc.get("AUTHOR", "")))
         if not doc_title:
             continue
 
-        # 제목 일치 판정 (양방향 부분 포함)
+        # 제목 일치 판정 (부제 제거 후 양방향 부분 포함)
         title_hit = n_title in doc_title or doc_title in n_title
         if not title_hit:
             continue
@@ -288,7 +305,7 @@ def match_book(title: str, author: str, docs: list):
                 score -= 1  # 저자 불일치 감점(오타/다른 책 방지)
 
         # ISBN(주로 정식 출판본)이 있는 항목을 강하게 우선
-        if str(doc.get("isbn", "")).strip():
+        if str(doc.get("EA_ISBN", "")).strip():
             score += 3
 
         if score > best_score:
@@ -299,23 +316,23 @@ def match_book(title: str, author: str, docs: list):
 
 def _matching_candidates(title, docs):
     """제목이 일치하는 레코드들의 (저자) 후보 목록을 만든다.
-    같은 책의 중복 레코드는 controlNo/저자명으로 합치고, 저자 미상은 제외한다."""
-    n_title = normalize(title)
+    같은 책의 중복 레코드는 ISBN/저자명으로 합치고, 저자 미상은 제외한다."""
+    n_title = normalize(strip_subtitle(title))
     cands = []
-    seen_book = set()      # controlNo 기준 중복 책 제거
+    seen_book = set()      # ISBN 기준 중복 책 제거
     seen_author = set()    # 같은 저자명 중복 제거
     for d in docs:
-        dt = normalize(d.get("titleInfo", ""))
+        dt = normalize(strip_subtitle(d.get("TITLE", "")))
         if not dt or not (n_title in dt or dt in n_title):
             continue
-        ctrl = str(d.get("controlNo", "")).strip()
-        if ctrl and ctrl in seen_book:
+        book = str(d.get("EA_ISBN", "")).strip()
+        if book and book in seen_book:
             continue
-        a = clean_author(d.get("authorInfo", ""))
+        a = clean_author(d.get("AUTHOR", ""))
         if not a or a in seen_author:
             continue
-        if ctrl:
-            seen_book.add(ctrl)
+        if book:
+            seen_book.add(book)
         seen_author.add(a)
         cands.append(a)
     return cands
@@ -340,14 +357,14 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
     success = doc is not None and score >= 1
 
     if success:
-        clean_title = strip_html(doc.get("titleInfo", title)) or str(title).strip()
+        clean_title = strip_subtitle(doc.get("TITLE", title)) or str(title).strip()
         # 표시 저자: 사용자가 입력한 저자(보통 한글)가 있으면 그대로 사용,
         # 없으면 API 저자를 정리해서 사용(로마자만 있을 수 있음)
         provided = str(author).strip()
-        api_auth = clean_author(doc.get("authorInfo", ""))
+        api_auth = clean_author(doc.get("AUTHOR", ""))
         clean_auth = provided if provided else (api_auth or "저자 미상")
-        isbn = str(doc.get("isbn", "")).strip()
-        publisher = strip_html(doc.get("pubInfo", "")).strip().rstrip(" :,")
+        isbn = str(doc.get("EA_ISBN", "")).strip()
+        publisher = strip_html(doc.get("PUBLISHER", "")).strip().rstrip(" :,")
 
         # 동명이서 후보: 선택된 저자(또는 표시 저자)와 다른 후보들만
         chosen = {clean_auth, api_auth}
@@ -511,7 +528,7 @@ def run_verification(df, title_col, author_col, cert_key, key_suffix):
 def main():
     st.title("📚 독서활동기록 ISBN 검증 대시보드")
     st.caption(
-        "독서기록을 국립중앙도서관 소장자료 데이터베이스와 대조하여 "
+        "독서기록을 국립중앙도서관 서지정보(ISBN) 데이터베이스와 대조하여 "
         "실제 도서만 정제된 형태로 정리합니다."
     )
 
@@ -529,7 +546,7 @@ def main():
                 "국립중앙도서관 발급키 (key)",
                 value="",
                 type="password",
-                help="소장자료 Open API 발급키를 입력하세요. 배포 시 Secrets에 넣으면 이 칸이 사라집니다.",
+                help="서지정보(Seoji) Open API 발급키를 입력하세요. 배포 시 Secrets에 넣으면 이 칸이 사라집니다.",
             ).strip()
 
         st.markdown("---")
@@ -546,9 +563,9 @@ def main():
                     st.success(f"성공! 검색 결과 {len(test['docs'])}건을 받았습니다.")
                     sample = test["docs"][0]
                     st.caption(
-                        f"예: {strip_html(sample.get('titleInfo', '?'))} / "
-                        f"{clean_author(sample.get('authorInfo', '?'))} / "
-                        f"ISBN {sample.get('isbn') or '없음'}"
+                        f"예: {strip_html(sample.get('TITLE', '?'))} / "
+                        f"{clean_author(sample.get('AUTHOR', '?'))} / "
+                        f"ISBN {sample.get('EA_ISBN') or '없음'}"
                     )
                 else:
                     st.warning("호출은 됐지만 결과가 0건입니다.")
