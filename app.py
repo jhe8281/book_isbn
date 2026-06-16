@@ -30,7 +30,7 @@ ERROR_MESSAGE = "오류: ISBN 미등재 또는 도서 정보 불일치"
 REQUEST_TIMEOUT = 30          # API 요청 타임아웃(초) - 서버가 느릴 때 대비
 REQUEST_RETRIES = 3           # 타임아웃 시 자동 재시도 횟수
 REQUEST_DELAY = 0.3           # 호출 간 대기(초) - 과도한 요청 방지
-PAGE_SIZE = 10                # API 검색 결과 페이지 크기
+PAGE_SIZE = 50               # API 검색 결과 페이지 크기(누락 방지 위해 넉넉히)
 
 st.set_page_config(page_title="독서기록 ISBN 검증 대시보드", page_icon="📚", layout="wide")
 
@@ -58,6 +58,31 @@ def strip_subtitle(title: str) -> str:
     # 전각/반각 콜론 기준으로 앞부분만 사용
     s = re.split(r"\s*[:：]\s*", s)[0]
     return s.strip()
+
+
+def _title_key(t: str) -> str:
+    """제목 비교용 키: 부제 제거 + 공백 1칸 정규화 + 가벼운 기호 제거(공백은 유지)."""
+    s = strip_subtitle(t).lower()
+    s = re.sub(r"[^\w가-힣 ]", "", s)   # 한글/영숫자/공백만
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def title_relation(in_title: str, doc_title: str):
+    """입력 제목과 결과 제목의 관계를 판정.
+    반환: 'exact' | 'prefix' | None
+      - exact : 부제 제거 후 완전히 같음
+      - prefix: 한쪽이 다른 쪽의 '단어 경계' 접두 (예: '토지' vs '토지 1')
+      - None  : '페인트' vs '2017년 …페인트회사…' 같은 중간 부분일치는 불인정
+    """
+    a, b = _title_key(in_title), _title_key(doc_title)
+    if not a or not b:
+        return None
+    if a == b:
+        return "exact"
+    if b.startswith(a + " ") or a.startswith(b + " "):
+        return "prefix"
+    return None
 
 
 def normalize(text) -> str:
@@ -276,37 +301,30 @@ def match_book(title: str, author: str, docs: list):
       - 제목 일치(부분 포함)는 필수
       - 저자 일치 시 가중치 부여
     """
-    n_title = normalize(strip_subtitle(title))
     n_author = normalize(author)
-    if not n_title:
+    if not _title_key(title):
         return None, 0
 
     best_doc, best_score = None, 0
     for doc in docs:
-        doc_title = normalize(strip_subtitle(doc.get("TITLE", "")))
+        rel = title_relation(title, doc.get("TITLE", ""))
+        if rel is None:                 # 중간 부분일치(페인트회사 등)는 제외
+            continue
         doc_author = normalize(clean_author(doc.get("AUTHOR", "")))
-        if not doc_title:
-            continue
 
-        # 제목 일치 판정 (부제 제거 후 양방향 부분 포함)
-        title_hit = n_title in doc_title or doc_title in n_title
-        if not title_hit:
-            continue
-
-        score = 1
-        if n_title == doc_title:
-            score += 2  # 완전 일치 가산점
+        # 제목 점수: 정확일치를 가장 강하게(ISBN보다 우선)
+        score = 5 if rel == "exact" else 2
 
         # 저자 일치 판정 (입력 저자가 있을 때만 평가)
         if n_author:
             if n_author in doc_author or doc_author in n_author:
-                score += 2
+                score += 3
             else:
-                score -= 1  # 저자 불일치 감점(오타/다른 책 방지)
+                score -= 2  # 저자 불일치 감점
 
-        # ISBN(주로 정식 출판본)이 있는 항목을 강하게 우선
+        # ISBN 보유 가산점(정확일치보다 약하게)
         if str(doc.get("EA_ISBN", "")).strip():
-            score += 3
+            score += 2
 
         if score > best_score:
             best_doc, best_score = doc, score
@@ -317,13 +335,11 @@ def match_book(title: str, author: str, docs: list):
 def _matching_candidates(title, docs):
     """제목이 일치하는 레코드들의 (저자) 후보 목록을 만든다.
     같은 책의 중복 레코드는 ISBN/저자명으로 합치고, 저자 미상은 제외한다."""
-    n_title = normalize(strip_subtitle(title))
     cands = []
     seen_book = set()      # ISBN 기준 중복 책 제거
     seen_author = set()    # 같은 저자명 중복 제거
     for d in docs:
-        dt = normalize(strip_subtitle(d.get("TITLE", "")))
-        if not dt or not (n_title in dt or dt in n_title):
+        if title_relation(title, d.get("TITLE", "")) is None:
             continue
         book = str(d.get("EA_ISBN", "")).strip()
         if book and book in seen_book:
@@ -358,17 +374,15 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
 
     if success:
         clean_title = strip_subtitle(doc.get("TITLE", title)) or str(title).strip()
-        # 표시 저자: 사용자가 입력한 저자(보통 한글)가 있으면 그대로 사용,
-        # 없으면 API 저자를 정리해서 사용(로마자만 있을 수 있음)
-        provided = str(author).strip()
+        # 표시 저자: 서지정보 DB의 정제된 저자를 기본으로 사용.
+        # (입력 저자는 '검색 정확도'를 높이는 데만 쓰고, 표시에는 그대로 쓰지 않음)
         api_auth = clean_author(doc.get("AUTHOR", ""))
-        clean_auth = provided if provided else (api_auth or "저자 미상")
+        clean_auth = api_auth or "저자 미상"
         isbn = str(doc.get("EA_ISBN", "")).strip()
         publisher = strip_html(doc.get("PUBLISHER", "")).strip().rstrip(" :,")
 
-        # 동명이서 후보: 선택된 저자(또는 표시 저자)와 다른 후보들만
-        chosen = {clean_auth, api_auth}
-        others = [c for c in _matching_candidates(title, docs) if c not in chosen]
+        # 동명이서 후보: 선택된 저자와 다른 후보들만
+        others = [c for c in _matching_candidates(title, docs) if c != clean_auth]
         others = others[:5]
 
         return {
@@ -452,14 +466,45 @@ def parse_pasted(text: str) -> pd.DataFrame:
           토지<TAB>박경리
           어린 왕자
     """
+def _looks_like_author(s: str) -> bool:
+    """콤마 뒤 문자열이 '저자'처럼 보이는지(문장/부제가 아닌지) 판정."""
+    s = s.strip()
+    if not s or len(s) > 20:
+        return False
+    if any(ch in s for ch in "?!？！…~"):   # 물음표·느낌표 등이 있으면 제목 일부로 봄
+        return False
+    if len(s.split()) > 3:                    # 단어가 너무 많으면 저자가 아님
+        return False
+    return True
+
+
+def parse_pasted(text: str) -> pd.DataFrame:
+    """
+    여러 줄 텍스트를 (책 제목, 저자) 표로 변환.
+    구분 규칙(제목에 콤마가 들어간 책을 보호):
+      1) 탭이 있으면 탭으로 제목/저자 구분 (엑셀에서 두 열 복사·붙여넣기)
+      2) 탭이 없고 콤마가 있으면, 콤마 뒤가 '저자처럼 보일 때만' 저자로 분리
+         - 예) '데미안, 헤르만 헤세' → 제목=데미안, 저자=헤르만 헤세
+         - 예) '진로를 정하지 못한 나, 비정상 인가요?' → 통째로 제목(저자 없음)
+      3) 그 외에는 한 줄 전체가 제목
+    """
     rows = []
     for line in str(text).splitlines():
         line = line.strip()
         if not line:
             continue
-        parts = re.split(r"[\t,]", line, maxsplit=1)
-        title = parts[0].strip()
-        author = parts[1].strip() if len(parts) > 1 else ""
+
+        title, author = line, ""
+        if "\t" in line:
+            parts = line.split("\t", 1)
+            title = parts[0].strip()
+            author = parts[1].strip() if len(parts) > 1 else ""
+        elif "," in line:
+            head, tail = line.split(",", 1)
+            if _looks_like_author(tail):
+                title, author = head.strip(), tail.strip()
+            # 저자처럼 안 보이면 line 전체가 제목(기본값 유지)
+
         if title:
             rows.append({"책 제목": title, "저자": author})
     return pd.DataFrame(rows)
@@ -640,8 +685,10 @@ def main():
     # ===== 탭 2: 직접 입력 =====
     with tab_paste:
         st.caption(
-            "한 줄에 한 권씩 입력하세요. 제목과 저자는 쉼표(,)로 구분하며, 저자는 생략할 수 있습니다. "
-            "엑셀에서 제목·저자 두 열을 복사해 붙여넣어도 됩니다."
+            "한 줄에 한 권씩 입력하세요. 저자를 함께 적으면 같은 제목의 다른 책과 더 정확히 구분됩니다. "
+            "제목·저자는 쉼표(,)로 구분하며 저자는 생략할 수 있습니다. "
+            "제목에 쉼표·물음표가 들어간 책은 통째로 제목으로 처리되니, 그런 책은 엑셀에서 두 열을 복사해 "
+            "붙여넣으면(탭 구분) 가장 정확합니다."
         )
         sample = "데미안, 헤르만 헤세\n어린 왕자, 생텍쥐페리\n토지, 박경리\n사피엔스"
         text = st.text_area(
