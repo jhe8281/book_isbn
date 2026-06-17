@@ -50,12 +50,18 @@ def strip_html(text) -> str:
 
 
 def display_title(title: str) -> str:
-    """화면 표시용 제목: 괄호는 그대로 두고, 콜론(:) 부제만 제거.
-    예) '(영원한 라이벌) 김대중 VS 김영삼' → 그대로
-        '페인트 : 이희영 장편소설'         → '페인트'
+    """화면 표시용 제목: 앞 괄호는 그대로 두고, 콜론(:) 부제와 '뒤쪽' 괄호만 제거.
+    예) '(영원한 라이벌) 김대중 VS 김영삼' → 그대로 (앞 괄호 유지)
+        '검은 사슴 (한국문학전집 024)'      → '검은 사슴' (뒤 괄호 제거)
+        '페인트 : 이희영 장편소설'          → '페인트'
     """
     s = strip_html(title)
     s = re.split(r"\s*[:：]\s*", s)[0]
+    # 끝에 붙은 괄호 묶음 반복 제거 (시리즈/판본 표기 등)
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\s*[\(\[（［〔《〈][^)\]）］〕》〉]*[\)\]）］〕》〉]\s*$", "", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -131,7 +137,9 @@ _OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "영역", "한역", "
                 "사진", "편집", "곁텍스트", "감수", "구성", "편저", "편", "감독",
                 "기획", "해설", "캘리그래피"]
 _ALL_ROLES = sorted(_AUTHOR_ROLES + _OTHER_ROLES, key=len, reverse=True)
-_ROLE_SPLIT_RE = re.compile(r"(.+?)\s*(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=[\s;,/]|$)")
+_ROLE_SPLIT_RE = re.compile(r"(.+?)\s+(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=[\s;,/·]|$)")
+_ORG_RE = re.compile(r"(출판사|출판|편집부|편찬|연구소|연구회|위원회|미디어|에디터스|"
+                     r"주식회사|\(주\)|문화원|박물관|진흥원|아카데미|컴퍼니|컴퍼니|스튜디오)")
 _HAS_COLON_ROLE_RE = re.compile(r"[^\s:：]+\s*[:：]")
 
 
@@ -142,10 +150,27 @@ def _is_author_role(role: str) -> bool:
     return any(a in role for a in _AUTHOR_ROLES)
 
 
+def _strip_edge_roles(nm: str) -> str:
+    """이름 끝에 토큰으로 붙은 역할어(글, 그림, 글·그림 등)와 기호를 제거."""
+    changed = True
+    while changed:
+        changed = False
+        nm = nm.strip(" .,;/·")
+        for role in _ALL_ROLES:
+            if nm.endswith(role) and len(nm) > len(role):
+                prev = nm[: -len(role)]
+                if prev[-1] in " .,;/·":      # 토큰 경계일 때만 제거(이름 글자 보호)
+                    nm = prev.strip(" .,;/·")
+                    changed = True
+                    break
+    return nm
+
+
 def _clean_name(nm: str) -> str:
-    """이름 하나를 정리: 생몰년[..] 제거, '성, 이름' → '이름 성'."""
+    """이름 하나를 정리: 생몰년[..] 제거, 끝 역할어 제거, '성, 이름' → '이름 성'."""
     nm = re.sub(r"\[[^\]]*\]", "", nm)          # [1877-1962] 등 제거
-    nm = re.sub(r"\s+", " ", nm).strip(" .,;/")
+    nm = re.sub(r"\s+", " ", nm).strip(" .,;/·")
+    nm = _strip_edge_roles(nm)                   # 끝에 남은 '글·그림' 등 제거
     if "," in nm:                                # 'Hesse, Hermann' / '헤세, 헤르만'
         parts = [p.strip() for p in nm.split(",") if p.strip()]
         if len(parts) == 2:
@@ -201,6 +226,16 @@ def clean_author(author_raw: str) -> str:
         if len(bracket_names) >= 2:
             first = _clean_name(bracket_names[0])
             return f"{first} 외 {len(bracket_names) - 1}인" if first else ""
+        # '강문일,김경진,…' 처럼 콤마/가운뎃점/세미콜론으로 여러 명 나열된 경우
+        parts = [_clean_name(p) for p in re.split(r"[,·;]", s)]
+        parts = [p for p in parts if len(p) >= 2]
+        non_org = [p for p in parts if not _ORG_RE.search(p)]
+        if non_org:                            # 개인 저자가 있으면 기관명은 제외
+            parts = non_org
+        if len(parts) >= 2:
+            return f"{parts[0]} 외 {len(parts) - 1}인"
+        if len(parts) == 1:
+            return parts[0]
         return _clean_name(s)
 
     # 지은이가 없으면 엮은이/옮긴이 등 기타 기여자를 대신 사용(선집·번역서 등)
@@ -339,6 +374,9 @@ def match_book(title: str, author: str, docs: list):
         # 저자 정보가 아예 없는 판본은 후순위로(‘저자 미상’ 방지)
         if not doc_author:
             score -= 3
+        # 저자 자리가 출판사·기관명인 판본도 후순위로(개인 저자 우선)
+        elif _ORG_RE.search(clean_author(doc.get("AUTHOR", ""))):
+            score -= 2
 
         # ISBN 보유 가산점(정확일치보다 약하게)
         if str(doc.get("EA_ISBN", "")).strip():
