@@ -81,9 +81,11 @@ def strip_subtitle(title: str) -> str:
 
 
 def _title_key(t: str) -> str:
-    """제목 비교용 키: 부제 제거 + 공백 1칸 정규화 + 가벼운 기호 제거(공백은 유지)."""
+    """제목 비교용 키: 부제·괄호 제거 + 끝 권수 제거 + 공백 정규화."""
     s = strip_subtitle(t).lower()
     s = re.sub(r"[^\w가-힣 ]", "", s)   # 한글/영숫자/공백만
+    # 끝에 붙은 권수 표기 제거: ' 1', ' 2권', ' 3편', ' 상/중/하' 등
+    s = re.sub(r"\s+(\d{1,4}\s*(권|편|화|부|집|쇄|화권)?|[상중하])$", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -287,15 +289,13 @@ def extract_records(data) -> list:
 
 
 @st.cache_data(show_spinner=False)
-def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dict:
+def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False) -> dict:
     """
-    제목으로 국립중앙도서관 서지정보(Seoji) DB를 검색.
-    반환 dict:
-      - docs:  list  (검색 결과 레코드)
-      - error: str | None  (호출/인증 오류 메시지. 미등재가 아니라 '호출 실패'일 때만 채워짐)
-      - raw:   str  (디버그용 응답 원문 일부)
+    국립중앙도서관 서지정보(Seoji) DB 검색. is_isbn=True면 ISBN으로, 아니면 제목으로.
+    반환 dict: docs / error / raw
     """
-    if not title or not str(title).strip():
+    q = str(query).strip()
+    if not q:
         return {"docs": [], "error": None, "raw": ""}
 
     params = {
@@ -303,8 +303,11 @@ def call_seoji_api(title: str, cert_key: str, use_fallback: bool = False) -> dic
         "result_style": "json",
         "page_no": 1,
         "page_size": PAGE_SIZE,
-        "title": str(title).strip(),
     }
+    if is_isbn:
+        params["isbn"] = re.sub(r"[^0-9Xx]", "", q)   # 하이픈 등 제거
+    else:
+        params["title"] = q
     headers = {"User-Agent": "Mozilla/5.0 (reading-checker)"}
 
     last_err = None
@@ -480,9 +483,27 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 엑셀 생성(openpyxl 스타일링)
-# ---------------------------------------------------------------------------
+def verify_isbn(isbn: str, cert_key: str) -> dict:
+    """ISBN 하나를 검증하여 결과 dict 반환."""
+    res = call_seoji_api(isbn, cert_key, is_isbn=True)
+    if res["error"]:
+        return {"검증결과": "오류", "정제된 도서정보": f"API 호출 오류: {res['error']}",
+                "ISBN": "", "출판사": ""}
+    docs = res["docs"]
+    if not docs:
+        return {"검증결과": "실패", "정제된 도서정보": "오류: 해당 ISBN을 찾을 수 없음",
+                "ISBN": "", "출판사": ""}
+    doc = docs[0]   # ISBN 검색은 보통 정확히 1건
+    clean_title = display_title(doc.get("TITLE", "")) or "(제목 미상)"
+    clean_auth = clean_author(doc.get("AUTHOR", "")) or "저자 미상"
+    found_isbn = str(doc.get("EA_ISBN", "")).strip() or re.sub(r"[^0-9Xx]", "", str(isbn))
+    publisher = strip_html(doc.get("PUBLISHER", "")).strip().rstrip(" :,")
+    return {
+        "검증결과": "성공",
+        "정제된 도서정보": f"{clean_title}({clean_auth})",
+        "ISBN": found_isbn,
+        "출판사": publisher,
+    }
 def build_excel(df: pd.DataFrame) -> bytes:
     """결과 DataFrame을 스타일이 적용된 엑셀 바이트로 변환."""
     wb = Workbook()
@@ -612,7 +633,11 @@ def run_verification(df, title_col, author_col, cert_key, key_suffix):
 
     result_df = pd.DataFrame(results, index=df.index)
     merged = pd.concat([df, result_df], axis=1)
+    _render_results(merged, result_df, total, key_suffix)
 
+
+def _render_results(merged, result_df, total, key_suffix):
+    """통계 + 결과 표 + 엑셀 다운로드 (여러 탭 공통)."""
     success_cnt = int((result_df["검증결과"] == "성공").sum())
     fail_cnt = int((result_df["검증결과"] == "실패").sum())
     error_cnt = int((result_df["검증결과"] == "오류").sum())
@@ -645,6 +670,27 @@ def run_verification(df, title_col, author_col, cert_key, key_suffix):
         key=f"download_{key_suffix}",
     )
     st.success("검증이 완료되었습니다. 위 버튼으로 결과 파일을 내려받으세요.")
+
+
+def run_isbn_verification(isbns, cert_key, key_suffix):
+    """ISBN 목록을 검증."""
+    if not cert_key:
+        st.error("먼저 좌측 사이드바에서 발급키를 입력해 주세요.")
+        return
+    total = len(isbns)
+    progress = st.progress(0.0, text="검증을 시작합니다...")
+    results = []
+    for code in isbns:
+        results.append(verify_isbn(code, cert_key))
+        progress.progress(len(results) / total,
+                          text=f"검증 중... ({len(results)}/{total})  ISBN: {code}")
+        time.sleep(REQUEST_DELAY)
+    progress.empty()
+
+    base = pd.DataFrame({"입력 ISBN": isbns})
+    result_df = pd.DataFrame(results)
+    merged = pd.concat([base, result_df], axis=1)
+    _render_results(merged, result_df, total, key_suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -714,8 +760,8 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # --- 본문: 두 가지 입력 방식 ---
-    tab_paste, tab_excel = st.tabs(["✍️ 직접 입력", "📂 엑셀 업로드"])
+    # --- 본문: 세 가지 입력 방식 ---
+    tab_paste, tab_excel, tab_isbn = st.tabs(["✍️ 직접 입력", "📂 엑셀 업로드", "🔢 ISBN"])
 
     # ===== 탭 1: 엑셀 업로드 =====
     with tab_excel:
@@ -784,6 +830,30 @@ def main():
             else:
                 st.caption(f"{len(df_paste)}권을 검증합니다.")
                 run_verification(df_paste, "책 제목", "저자", cert_key, "paste")
+
+    # ===== 탭 3: ISBN =====
+    with tab_isbn:
+        st.caption(
+            "ISBN을 한 줄에 하나씩 입력하세요. 하이픈(-)이 있어도 됩니다. "
+            "ISBN으로 찾으면 권수·판본까지 정확한 책 한 권을 바로 확인합니다."
+        )
+        isbn_text = st.text_area(
+            "ISBN 목록 붙여넣기",
+            height=200,
+            placeholder="9791136401212\n978-89-364-7423-5\n9788937460777",
+            key="isbn_area",
+        )
+        if st.button("🔍 ISBN 검증 시작", type="primary", key="verify_isbn"):
+            codes = []
+            for line in str(isbn_text).splitlines():
+                c = re.sub(r"[^0-9Xx]", "", line)
+                if c:
+                    codes.append(c)
+            if not codes:
+                st.warning("입력된 ISBN이 없습니다. 한 줄에 하나씩 입력해 주세요.")
+            else:
+                st.caption(f"{len(codes)}건을 검증합니다.")
+                run_isbn_verification(codes, cert_key, "isbn")
 
 
 if __name__ == "__main__":
