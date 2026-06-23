@@ -13,6 +13,7 @@ import io
 import os
 import re
 import time
+import urllib.parse
 
 import pandas as pd
 import requests
@@ -298,16 +299,19 @@ def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False) -> dict:
     if not q:
         return {"docs": [], "error": None, "raw": ""}
 
-    params = {
-        "cert_key": cert_key,
-        "result_style": "json",
-        "page_no": 1,
-        "page_size": PAGE_SIZE,
-    }
+    # 검색어를 직접 UTF-8 퍼센트 인코딩하여 URL을 구성한다.
+    # (requests 자동 인코딩이 일부 한글 음절에서 서버와 어긋나 011을 유발하는 문제 회피)
+    parts = [
+        f"cert_key={urllib.parse.quote(str(cert_key), safe='')}",
+        "result_style=json",
+        "page_no=1",
+        f"page_size={PAGE_SIZE}",
+    ]
     if is_isbn:
-        params["isbn"] = re.sub(r"[^0-9Xx]", "", q)   # 하이픈 등 제거
+        parts.append(f"isbn={urllib.parse.quote(re.sub(r'[^0-9Xx]', '', q), safe='')}")
     else:
-        params["title"] = q
+        parts.append(f"title={urllib.parse.quote(q, safe='')}")
+    request_url = API_URL + "?" + "&".join(parts)
     headers = {"User-Agent": "Mozilla/5.0 (reading-checker)"}
 
     last_err = None
@@ -315,9 +319,7 @@ def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False) -> dict:
     data = None
     for attempt in range(REQUEST_RETRIES):
         try:
-            resp = requests.get(
-                API_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT
-            )
+            resp = requests.get(request_url, headers=headers, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             raw = resp.text[:800]
             data = resp.json()
