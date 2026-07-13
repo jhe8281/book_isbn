@@ -138,7 +138,7 @@ _OTHER_ROLES = ["옮긴이", "옮김", "역자", "번역", "영역", "한역", "
                 "사진", "편집", "곁텍스트", "감수", "구성", "편저", "편", "감독",
                 "기획", "해설", "캘리그래피", "낭독자", "낭독", "녹음", "연주",
                 "노래", "출연", "진행", "원작자", "각색", "번안", "주해", "주석",
-                "교정", "교열", "디자인", "표지", "장정"]
+                "교정", "교열", "디자인", "표지", "장정", "만화", "작화", "그림작가"]
 _ALL_ROLES = sorted(_AUTHOR_ROLES + _OTHER_ROLES, key=len, reverse=True)
 _ROLE_SPLIT_RE = re.compile(r"(.+?)\s+(" + "|".join(map(re.escape, _ALL_ROLES)) + r")(?=[\s;,/·]|$)")
 _ORG_RE = re.compile(r"(출판사|출판|편집부|편찬|연구소|연구회|위원회|미디어|에디터스|"
@@ -147,10 +147,17 @@ _HAS_COLON_ROLE_RE = re.compile(r"[^\s:：]+\s*[:：]")
 
 
 def _is_author_role(role: str) -> bool:
-    """역할어 문자열이 '저자'에 해당하는지 판정(번역/삽화 등은 제외)."""
-    if any(o in role for o in _OTHER_ROLES):
+    """역할어가 '저자'에 해당하는지 판정.
+    '글·그림'처럼 여러 역할이 붙은 경우, 저자 역할(글/지음 등)이 하나라도 있으면 저자로 본다.
+    (단, '원작자' 같은 단일 비저자 역할은 그대로 비저자)
+    """
+    tokens = [t for t in re.split(r"[·,/\s]+", role.strip()) if t]
+    if any(tok in _AUTHOR_ROLES for tok in tokens):
+        return True
+    if any(tok in _OTHER_ROLES for tok in tokens):
         return False
-    return any(a in role for a in _AUTHOR_ROLES)
+    # 토큰이 딱 안 맞으면 부분 문자열로 보조 판정
+    return any(a in role for a in _AUTHOR_ROLES) and not any(o in role for o in _OTHER_ROLES)
 
 
 def _strip_edge_roles(nm: str) -> str:
