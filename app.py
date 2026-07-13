@@ -366,6 +366,9 @@ def match_book(title: str, author: str, docs: list):
         rel = title_relation(title, doc.get("TITLE", ""))
         if rel is None:                 # 중간 부분일치(페인트회사 등)는 제외
             continue
+        # 종이책만 인정 (전자책·오디오북·판형 미표기는 제외)
+        if str(doc.get("FORM", "")).strip() != "종이책":
+            continue
         doc_author = normalize(clean_author(doc.get("AUTHOR", "")))
 
         # 제목 점수: 정확일치를 가장 강하게(ISBN보다 우선)
@@ -389,15 +392,6 @@ def match_book(title: str, author: str, docs: list):
         if str(doc.get("EA_ISBN", "")).strip():
             score += 2
 
-        # 판형 선호: 독서기록엔 종이책이 적절 → 전자책/오디오북은 후순위
-        form = str(doc.get("FORM", "")).strip()
-        if "오디오북" in form:
-            score -= 2
-        elif "전자책" in form:
-            score -= 1
-        elif "종이책" in form:
-            score += 1
-
         if score > best_score:
             best_doc, best_score = doc, score
 
@@ -412,6 +406,8 @@ def _matching_candidates(title, docs):
     seen_author = set()    # 같은 저자명 중복 제거
     for d in docs:
         if title_relation(title, d.get("TITLE", "")) is None:
+            continue
+        if str(d.get("FORM", "")).strip() != "종이책":   # 종이책만
             continue
         book = str(d.get("EA_ISBN", "")).strip()
         if book and book in seen_book:
@@ -699,10 +695,24 @@ def run_isbn_verification(isbns, cert_key, key_suffix):
 # Streamlit UI
 # ---------------------------------------------------------------------------
 def main():
-    st.title("📚 독서활동기록 ISBN 검증 대시보드")
+    # --- 제목 줄: 제목 + 제작자 배지 ---
+    st.markdown(
+        "<div style='display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:2px;'>"
+        "<span style='font-size:34px;font-weight:800;line-height:1.2;'>📚 독서활동기록 ISBN 검증 대시보드</span>"
+        "<span style='display:inline-block;padding:5px 12px;border-radius:999px;"
+        "background:linear-gradient(135deg,#2E75B6,#5B9BD5);white-space:nowrap;'>"
+        "<span style='color:#FFFFFF;font-weight:800;font-size:13px;letter-spacing:.3px;'>made by 임지환</span>"
+        "<span style='color:#E6F0FA;font-weight:500;font-size:12px;'> with Claude</span>"
+        "</span></div>",
+        unsafe_allow_html=True,
+    )
     st.caption(
         "독서기록을 국립중앙도서관 서지정보(ISBN) 데이터베이스와 대조하여 "
         "실제 도서만 정제된 형태로 정리합니다."
+    )
+    st.link_button(
+        "🔗 국립중앙도서관 서지정보 바로가기",
+        "https://www.nl.go.kr/seoji/",
     )
 
     # --- 사이드바: API 키 및 옵션 ---
@@ -751,15 +761,6 @@ def main():
         st.markdown(
             "**발급키 안내:** 국립중앙도서관 "
             "[Open API](https://www.nl.go.kr/NL/contents/N31101010000.do) 신청·관리"
-        )
-        st.markdown(
-            "<div style='margin-top:14px;padding:10px 12px;border-radius:10px;"
-            "background:linear-gradient(135deg,#2E75B6,#5B9BD5);text-align:center;'>"
-            "<span style='color:#FFFFFF;font-weight:800;font-size:15px;letter-spacing:.3px;'>"
-            "made by 임지환</span>"
-            "<span style='color:#E6F0FA;font-weight:500;font-size:13px;'> with Claude</span>"
-            "</div>",
-            unsafe_allow_html=True,
         )
 
     # --- 본문: 세 가지 입력 방식 ---
