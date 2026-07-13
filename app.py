@@ -93,18 +93,16 @@ def _title_key(t: str) -> str:
 
 def title_relation(in_title: str, doc_title: str):
     """입력 제목과 결과 제목의 관계를 판정.
-    반환: 'exact' | 'prefix' | None
-      - exact : 부제 제거 후 (띄어쓰기 무시) 완전히 같음
-      - prefix: 한쪽이 다른 쪽의 '띄어쓰기 경계' 접두 (예: '토지' vs '토지 1')
-      - None  : '페인트' vs '…페인트회사…', '국가' vs '국가론' 등은 불인정
+    반환: 'exact' | None
+      - exact : 부제·괄호·끝 권수 제거 후 (띄어쓰기 무시) 완전히 같음
+      - None  : '시한부' vs '시한부 연애', '국가' vs '국가론' 등 다른 제목은 불인정
+    (권수 차이 '토지'/'토지 1'는 제목 키 단계에서 권수를 떼므로 exact로 처리됨)
     """
     a, b = _title_key(in_title), _title_key(doc_title)
     if not a or not b:
         return None
     if a.replace(" ", "") == b.replace(" ", ""):   # 띄어쓰기 차이는 같은 제목으로
         return "exact"
-    if b.startswith(a + " ") or a.startswith(b + " "):  # 권수/시리즈 등 경계 접두
-        return "prefix"
     return None
 
 
