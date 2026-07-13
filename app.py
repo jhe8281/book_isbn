@@ -288,9 +288,11 @@ def extract_records(data) -> list:
 
 
 @st.cache_data(show_spinner=False)
-def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False) -> dict:
+def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False,
+                   author: str = "") -> dict:
     """
     국립중앙도서관 서지정보(Seoji) DB 검색. is_isbn=True면 ISBN으로, 아니면 제목으로.
+    author가 주어지면 제목+저자로 함께 좁혀 검색한다.
     반환 dict: docs / error / raw
     """
     q = str(query).strip()
@@ -309,6 +311,8 @@ def call_seoji_api(query: str, cert_key: str, is_isbn: bool = False) -> dict:
         parts.append(f"isbn={urllib.parse.quote(re.sub(r'[^0-9Xx]', '', q), safe='')}")
     else:
         parts.append(f"title={urllib.parse.quote(q, safe='')}")
+        if str(author).strip():
+            parts.append(f"author={urllib.parse.quote(str(author).strip(), safe='')}")
     request_url = API_URL + "?" + "&".join(parts)
     headers = {"User-Agent": "Mozilla/5.0 (reading-checker)"}
 
@@ -422,7 +426,11 @@ def _matching_candidates(title, docs):
 
 def verify_row(title: str, author: str, cert_key: str) -> dict:
     """한 행(도서)을 검증하여 결과 dict 반환."""
-    res = call_seoji_api(title, cert_key)
+    author = str(author).strip()
+
+    # 저자가 있으면 제목+저자로 먼저 좁혀 검색(흔한 제목이 상위에서 밀리는 문제 완화)
+    res = call_seoji_api(title, cert_key, author=author) if author else \
+          call_seoji_api(title, cert_key)
 
     # 호출/인증 자체가 실패한 경우 → '미등재'와 구분해서 표시
     if res["error"]:
@@ -439,9 +447,18 @@ def verify_row(title: str, author: str, cert_key: str) -> dict:
     doc, score = match_book(title, author, docs)
     success = doc is not None and score >= 1
 
+    # 저자 병행검색으로 못 찾았으면 제목만으로 다시 검색
+    if not success and author:
+        res_t = call_seoji_api(title, cert_key)
+        if not res_t["error"]:
+            doc_t, score_t = match_book(title, author, res_t["docs"])
+            if doc_t is not None and score_t >= 1:
+                doc, score, docs = doc_t, score_t, res_t["docs"]
+                success = True
+
     # 콤마가 제목의 일부였을 가능성: '제목, 저자'로 잘못 쪼개졌다면
     # 둘을 합쳐 통째 제목으로 한 번 더 검색해 본다.
-    if not success and str(author).strip():
+    if not success and author:
         combined = f"{title} {author}".strip()
         res2 = call_seoji_api(combined, cert_key)
         if not res2["error"]:
