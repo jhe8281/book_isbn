@@ -199,6 +199,13 @@ def clean_author(author_raw: str) -> str:
         return ""
     s = strip_html(author_raw)
 
+    # '[지음]', '[옮김]'처럼 대괄호로 감싼 역할어는 괄호를 벗겨 정상 역할어로.
+    # (생몰년 '[1877-1962]'는 숫자/기호뿐이라 여기서 건드리지 않고 이름 정리 때 제거됨)
+    def _unwrap_role(m):
+        inner = m.group(1).strip()
+        return f" {inner} " if _is_author_role(inner) or any(o == inner for o in _OTHER_ROLES) else m.group(0)
+    s = re.sub(r"\[([^\]]+)\]", _unwrap_role, s)
+
     authors = []   # 지은이/지음/글 등
     others = []    # 엮음/옮김/펴낸이 등 (저자가 없을 때 대비)
     matched = False
